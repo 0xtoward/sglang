@@ -1,0 +1,43 @@
+[33mcommit 92aa4c0af9303da90e58c59945323f914ac7bfa0[m
+Author: 0xtoward <diotima102323@gmail.com>
+Date:   Tue Oct 7 07:27:00 2025 +0800
+
+    fix: support ModernBERT in triton_backend by slightly editing triton_backend.py
+
+[1mdiff --git a/python/sglang/srt/layers/attention/triton_backend.py b/python/sglang/srt/layers/attention/triton_backend.py[m
+[1mindex b67acbc3f..18a66b1c3 100644[m
+[1m--- a/python/sglang/srt/layers/attention/triton_backend.py[m
+[1m+++ b/python/sglang/srt/layers/attention/triton_backend.py[m
+[36m@@ -812,14 +812,11 @@[m [mclass TritonAttnBackend(AttentionBackend):[m
+         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:[m
+             causal = False[m
+ [m
+[31m-        # Deterministic mode: use unified 1-stage kernel[m
+[31m-        if self.enable_deterministic:[m
+[31m-            return self._forward_extend_unified([m
+[31m-                q, o, layer, forward_batch, causal, logits_soft_cap, sinks[m
+[31m-            )[m
+[31m-[m
+[31m-        # Normal mode: use original 2-stage kernel[m
+[31m-        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:[m
+[32m+[m[32m        if ([m
+[32m+[m[32m            layer.sliding_window_size is not None[m
+[32m+[m[32m            and layer.sliding_window_size > -1[m
+[32m+[m[32m            and layer.attn_type != AttentionType.ENCODER_ONLY[m
+[32m+[m[32m        ):[m
+             sliding_window_size = ([m
+                 layer.sliding_window_size[m
+             )  # Needed for sliding window mask[m
+[36m@@ -872,7 +869,11 @@[m [mclass TritonAttnBackend(AttentionBackend):[m
+         bs = forward_batch.batch_size[m
+ [m
+         # Determine sliding window settings[m
+[31m-        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:[m
+[32m+[m[32m        if ([m
+[32m+[m[32m            layer.sliding_window_size is not None[m
+[32m+[m[32m            and layer.sliding_window_size > -1[m
+[32m+[m[32m            and layer.attn_type != AttentionType.ENCODER_ONLY[m
+[32m+[m[32m        ):[m
+             sliding_window_size = layer.sliding_window_size[m
+             # Note: for unified kernel, we use full kv_indptr (not window)[m
+             prefix_kv_indptr = self.forward_metadata.window_kv_indptr[m
