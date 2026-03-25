@@ -183,10 +183,7 @@ class MiniCPMAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         if self.attn_use_rope:
-            orig_dtype = q.dtype
-            q, k = q.float(), k.float()
             q, k = self.rotary_emb(positions, q, k)
-            q, k = q.to(orig_dtype), k.to(orig_dtype)
 
         attn_output = self.attn(q, k, v, forward_batch)
 
@@ -324,10 +321,7 @@ class MiniCPMLightningMixer(nn.Module):
         if self.use_rope:
             q = q.reshape(-1, self.num_heads * self.head_dim)
             k = k.reshape(-1, self.num_kv_heads * self.head_dim)
-            orig_dtype = q.dtype
-            q, k = q.float(), k.float()
             q, k = self.rotary_emb(positions, q, k)
-            q, k = q.to(orig_dtype), k.to(orig_dtype)
 
         q = q.reshape(-1, self.num_heads, self.head_dim)
         k = k.reshape(-1, self.num_kv_heads, self.head_dim)
@@ -481,29 +475,31 @@ class MiniCPMDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Build sparse metadata (model-specific logic!)
+        scale = self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
 
-        # Self Attention
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        # Self Attention (fused add + RMSNorm)
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(
+                hidden_states, residual
+            )
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        hidden_states = residual + hidden_states * (
-            self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
-        )
+        hidden_states = hidden_states * scale
 
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        # Fully Connected (fused add + RMSNorm)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states, residual
+        )
         hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states * (
-            self.config.scale_depth / math.sqrt(self.config.num_hidden_layers)
-        )
+        hidden_states = hidden_states * scale
 
-        return hidden_states, None
+        return hidden_states, residual
 
 
 class MiniCPMModel(nn.Module):
@@ -557,7 +553,7 @@ class MiniCPMModel(nn.Module):
                 forward_batch,
                 residual,
             )
-        hidden_states = self.norm(hidden_states)
+        hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 

@@ -263,7 +263,7 @@ class MiniCPMSparseBackend(AttentionBackend):
             kernel_topk = tilelang.math.next_power_of_2(kernel_topk) // 2
         kernel_topk = max(8, kernel_topk)
         # FIXME: Read from model config
-        dtype_str = "bfloat16"
+        dtype_str = "float16"
         self.decode_fused_kernels = {}
         self.prefill_fused_kernels = {}
         bucketed_pooled_k_len = _bucket_size(pooled_k_len)
@@ -581,13 +581,13 @@ class MiniCPMSparseBackend(AttentionBackend):
                 metadata = self.forward_metadata
                 compressed_k = torch.full(
                     (forward_batch.batch_size * self.max_context_len // self.k1_kernel_stride, self.head_group_num, self.head_dim),
-                    dtype=torch.bfloat16,
+                    dtype=torch.float16,
                     device=self.device,
                     fill_value=float('-inf')
                 )
                 compressed_k2 = torch.full(
                     (forward_batch.batch_size * self.max_context_len // self.k2_kernel_stride, self.head_group_num, self.head_dim), 
-                    dtype=torch.bfloat16, 
+                    dtype=torch.float16, 
                     device=self.device,
                     fill_value=float('-inf')
                 )
@@ -747,7 +747,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                     k2_token_nums=forward_batch.batch_size
                     * self.max_context_len
                     // self.k2_kernel_stride,
-                    dtype=torch.bfloat16,
+                    dtype=torch.float16,
                     device=self.device,
                     max_context_length=self.max_context_len,
                     split_stage1=self.split_stage1,
@@ -1340,7 +1340,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                             self.head_group_num,
                             self.head_dim,
                         ),
-                        dtype=torch.bfloat16,
+                        dtype=torch.float16,
                         device=self.device,
                     ),
                     "compress_k2": torch.zeros(
@@ -1349,7 +1349,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                             self.head_group_num,
                             self.head_dim,
                         ),
-                        dtype=torch.bfloat16,
+                        dtype=torch.float16,
                         device=self.device,
                     ),
                     "k1.cu_seqlens": torch.zeros(

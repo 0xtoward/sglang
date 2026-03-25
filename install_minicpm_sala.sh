@@ -10,7 +10,7 @@ DEPS_DIR="${REPO_ROOT}/3rdparty"
 if [ -n "$1" ]; then
     export UV_INDEX_URL="$1"
 elif [ -z "${UV_INDEX_URL}" ]; then
-    export UV_INDEX_URL="https://pypi.org/simple"
+    export UV_INDEX_URL="https://mirrors.aliyun.com/pypi/simple/"
 fi
 
 echo "============================================"

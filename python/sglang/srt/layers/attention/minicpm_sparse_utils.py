@@ -340,7 +340,7 @@ def allocate_and_compress_keys(
     metadata: "FlashAttentionMetadata",
     k1_token_nums: int,
     k2_token_nums: int,
-    dtype: torch.dtype = torch.bfloat16,
+    dtype: torch.dtype = torch.float16,
     device: torch.device = None,
     max_context_length: int = 32768,
     split_stage1: bool = False,
@@ -640,9 +640,9 @@ def compressed_attention_tilelang(
         if q.dtype == torch.float16:
             dtype_str = "float16"
         elif q.dtype == torch.bfloat16:
-            dtype_str = "bfloat16"
+            dtype_str = "float16"
         else:
-            dtype_str = "bfloat16"
+            dtype_str = "float16"
 
         # Allocate output tensors
         topk_indices = torch.full((num_kv_heads, total_q_len, kernel_topk), -1, dtype=torch.int32, device=q.device)
