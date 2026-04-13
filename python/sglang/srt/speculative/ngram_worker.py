@@ -230,6 +230,10 @@ class NGRAMWorker:
             )
             # Store accept_lens for per-request metrics
             accept_lens = verify_input.accept_length
+            if self.target_worker.model_runner.minicpm_hybrid_config is not None:
+                self.target_worker.model_runner.attn_backend.update_simple_gla_state_after_target_verify(
+                    accepted_steps=accept_lens.to(torch.int64)
+                )
             if batch.return_logprob:
                 add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
             self._update_ngram_cache(batch)

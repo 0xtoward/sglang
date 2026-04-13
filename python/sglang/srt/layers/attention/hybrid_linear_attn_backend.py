@@ -46,7 +46,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
-from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils import is_cuda, is_npu
 
 
@@ -102,6 +102,21 @@ def _build_slope_tensor(nheads: int) -> torch.Tensor:
 
     slopes = torch.tensor(get_slopes(nheads))
     return slopes
+
+
+def _needs_tree_custom_attn_mask(spec_info: Optional[SpecInput]) -> bool:
+    """Return whether speculative verify needs tree traversal tensors.
+
+    EAGLE exposes this through ``topk > 1``. NGRAM verify uses a tree-shaped
+    verify structure too, but its spec input does not define ``topk``.
+    """
+    if spec_info is None:
+        return False
+
+    if getattr(spec_info, "topk", 1) > 1:
+        return True
+
+    return spec_info.spec_input_type == SpecInputType.NGRAM_VERIFY
 
 
 # Kernel to track mamba states if needed based on track mask
@@ -252,7 +267,7 @@ class MambaAttnBackendBase(AttentionBackend):
                     device=forward_batch.input_ids.device,
                 )
 
-                if forward_batch.spec_info.topk > 1:
+                if _needs_tree_custom_attn_mask(forward_batch.spec_info):
                     retrieve_next_token = forward_batch.spec_info.retrive_next_token
                     retrieve_next_sibling = forward_batch.spec_info.retrive_next_sibling
                     # retrieve_next_token is None during dummy run so skip tensor creation
@@ -512,7 +527,7 @@ class MambaAttnBackendBase(AttentionBackend):
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
 
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
-        if forward_mode.is_target_verify() and spec_info.topk > 1:
+        if forward_mode.is_target_verify() and _needs_tree_custom_attn_mask(spec_info):
             # They are None during cuda graph capture so skip the copy_...
             # self.retrieve_next_token_list[bs - 1].copy_(spec_info.retrive_next_token)
             # self.retrieve_next_sibling_list[bs - 1].copy_(spec_info.retrive_next_sibling)
@@ -573,7 +588,7 @@ class MambaAttnBackendBase(AttentionBackend):
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
-        if forward_mode.is_target_verify() and spec_info.topk > 1:
+        if forward_mode.is_target_verify() and _needs_tree_custom_attn_mask(spec_info):
             bs_without_pad = spec_info.retrive_next_token.shape[0]
             self.retrieve_next_token_list[bs - 1][:bs_without_pad].copy_(
                 spec_info.retrive_next_token
@@ -1436,6 +1451,52 @@ class HybridLinearAttnBackend(AttentionBackend):
                 :, src_track_indices, track_steps
             ].to(conv_states.dtype, copy=False)
 
+    def update_simple_gla_state_after_target_verify(
+        self,
+        accepted_steps: torch.Tensor,
+        mamba_track_indices: Optional[torch.Tensor] = None,
+        mamba_steps_to_track: Optional[torch.Tensor] = None,
+    ):
+        request_number = accepted_steps.shape[0]
+
+        state_indices_tensor = (
+            self.linear_attn_backend.forward_metadata.mamba_cache_indices[
+                :request_number
+            ]
+        )
+        intermediate_state_indices = torch.arange(
+            request_number, dtype=torch.int32, device=state_indices_tensor.device
+        )
+
+        mamba_caches = (
+            self.linear_attn_backend.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+        )
+        assert isinstance(mamba_caches, MambaPool.SpeculativeState)
+
+        temporal_states = mamba_caches.temporal
+        intermediate_state_cache = mamba_caches.intermediate_ssm
+
+        valid_mask = accepted_steps >= 0
+        dst_state_indices = state_indices_tensor[valid_mask].to(torch.int64)
+        src_state_indices = intermediate_state_indices[valid_mask].to(torch.int64)
+        last_steps = accepted_steps[valid_mask].to(torch.int64)
+
+        temporal_states[:, dst_state_indices, :] = intermediate_state_cache[
+            :, src_state_indices, last_steps
+        ].to(temporal_states.dtype, copy=False)
+
+        if mamba_track_indices is not None:
+            assert mamba_steps_to_track is not None
+            track_mask = mamba_steps_to_track >= 0
+            track_steps = mamba_steps_to_track[track_mask].to(torch.int64)
+            if track_steps.numel() == 0:
+                return
+            dst_track_indices = mamba_track_indices[track_mask].to(torch.int64)
+            src_track_indices = intermediate_state_indices[track_mask].to(torch.int64)
+            temporal_states[:, dst_track_indices, :] = intermediate_state_cache[
+                :, src_track_indices, track_steps
+            ].to(temporal_states.dtype, copy=False)
+
 
 class SimpleGLAAttnBackend(MambaAttnBackendBase):
     """Attention backend for MiniCPM hybrid models using the SimpleGLA CUDA kernels.
@@ -1564,12 +1625,23 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
         head_dim = q.shape[3]
         if forward_batch.forward_mode.is_decode():
             seq_len = 1
+        elif forward_batch.forward_mode.is_target_verify():
+            seq_len = forward_batch.spec_info.draft_token_num
         else:
             seq_len = torch.max(forward_batch.extend_seq_lens)
 
         mamba_indices = self._get_mamba_indices(forward_batch)
         initial_state = None
-        has_initial_state = forward_batch.extend_prefix_lens is not None and forward_batch.extend_prefix_lens > 0
+        if forward_batch.forward_mode.is_target_verify():
+            has_initial_state = torch.ones(
+                mamba_indices.shape[0], dtype=torch.bool, device=mamba_indices.device
+            )
+        elif forward_batch.extend_prefix_lens is not None:
+            has_initial_state = forward_batch.extend_prefix_lens > 0
+        else:
+            has_initial_state = torch.zeros(
+                mamba_indices.shape[0], dtype=torch.bool, device=mamba_indices.device
+            )
         if forward_batch.forward_mode.is_decode() or has_initial_state.any():
             cache_idx = self.req_to_token_pool.mamba_map.get(layer_id)
             if cache_idx is not None:
@@ -1587,7 +1659,47 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
         g_gamma = self.g_gamma
 
         mode = "fused_recurrent" if seq_len < 64 else "chunk"
-        if forward_batch.forward_mode.is_decode() or mode == "fused_recurrent":
+        if forward_batch.forward_mode.is_target_verify():
+            cache_idx = self.req_to_token_pool.mamba_map.get(layer_id)
+            if cache_idx is None:
+                raise RuntimeError(
+                    f"SimpleGLAAttnBackend layer {layer_id} is missing from mamba_map. "
+                    f"Cannot save speculative state - layer must be registered in cache_params.layers. "
+                    f"Available layers: {list(self.req_to_token_pool.mamba_map.keys())}"
+                )
+
+            mamba_caches = (
+                self.req_to_token_pool.get_speculative_mamba2_params_all_layers()
+            )
+            assert isinstance(mamba_caches, MambaPool.SpeculativeState)
+
+            batch_size = mamba_indices.shape[0]
+            q_steps = q.reshape(batch_size, seq_len, num_heads, head_dim)
+            k_steps = k.reshape(batch_size, seq_len, k.shape[2], k.shape[3])
+            v_steps = v.reshape(batch_size, seq_len, v.shape[2], v.shape[3])
+
+            state = initial_state
+            outputs = []
+            for step in range(seq_len):
+                o_step, state = fused_recurrent_simple_gla(
+                    q=q_steps[:, step : step + 1],
+                    k=k_steps[:, step : step + 1],
+                    v=v_steps[:, step : step + 1],
+                    g_gamma=g_gamma,
+                    scale=scale,
+                    initial_state=state,
+                    output_final_state=True,
+                )
+                mamba_caches.intermediate_ssm[cache_idx, :batch_size, step] = state.to(
+                    mamba_caches.intermediate_ssm.dtype, copy=False
+                )
+                outputs.append(o_step)
+
+            o = torch.cat(outputs, dim=1).reshape(
+                1, batch_size * seq_len, num_heads, head_dim
+            )
+            final_state = state
+        elif forward_batch.forward_mode.is_decode() or mode == "fused_recurrent":
             o, final_state = fused_recurrent_simple_gla(
                 q=q,
                 k=k,
