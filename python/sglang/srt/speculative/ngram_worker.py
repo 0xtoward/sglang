@@ -41,6 +41,7 @@ class NGRAMWorker:
         self.max_match_window_size: int = (
             server_args.speculative_ngram_max_match_window_size
         )
+        self.max_bfs_breadth: int = server_args.speculative_ngram_max_bfs_breadth
 
         self.max_batch_size = target_worker.max_running_requests
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
@@ -210,6 +211,34 @@ class NGRAMWorker:
             batch_tokens.append(put_ids)
         self.ngram_cache.batch_put(batch_tokens)
 
+    def _compute_accepted_steps_for_state_commit(
+        self,
+        batch: ScheduleBatch,
+        verify_input: NgramVerifyInput,
+        accept_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        accepted_length = accept_lens.to(torch.int64) + 1
+        has_tree_branches = (
+            self.max_bfs_breadth > 1
+            and verify_input.accepted_indices.numel() > 0
+        )
+
+        if not has_tree_branches:
+            return accepted_length - 1
+
+        cumulative_accepted_lengths = torch.cumsum(accepted_length, dim=0)
+        accepted_indices_offset = torch.arange(
+            0,
+            len(batch.seq_lens) * batch.spec_info.draft_token_num,
+            step=batch.spec_info.draft_token_num,
+            dtype=cumulative_accepted_lengths.dtype,
+            device=cumulative_accepted_lengths.device,
+        )
+        return (
+            verify_input.accepted_indices[cumulative_accepted_lengths - 1]
+            - accepted_indices_offset
+        )
+
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
         self._prepare_for_speculative_decoding(batch)
         model_worker_batch = batch.get_model_worker_batch()
@@ -231,8 +260,11 @@ class NGRAMWorker:
             # Store accept_lens for per-request metrics
             accept_lens = verify_input.accept_length
             if self.target_worker.model_runner.minicpm_hybrid_config is not None:
+                accepted_steps = self._compute_accepted_steps_for_state_commit(
+                    batch, verify_input, accept_lens
+                )
                 self.target_worker.model_runner.attn_backend.update_simple_gla_state_after_target_verify(
-                    accepted_steps=accept_lens.to(torch.int64)
+                    accepted_steps=accepted_steps
                 )
             if batch.return_logprob:
                 add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
