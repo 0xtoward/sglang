@@ -1570,6 +1570,57 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
                 forward_batch.req_pool_indices
             )
 
+    def _build_tree_parent_tokens(
+        self, batch_size: int, seq_len: int
+    ) -> Optional[torch.Tensor]:
+        """Build parent step indices for speculative tree verification.
+
+        ``retrive_next_token`` stores the first child of each tree node and
+        ``retrive_next_sibling`` stores the next sibling.  SimpleGLA recurrent
+        states must branch by this parent relation during tree verify; otherwise
+        siblings incorrectly inherit state from the previously visited node.
+        """
+        forward_metadata = getattr(self, "forward_metadata", None)
+        if forward_metadata is None:
+            return None
+
+        retrieve_next_token = getattr(forward_metadata, "retrieve_next_token", None)
+        retrieve_next_sibling = getattr(
+            forward_metadata, "retrieve_next_sibling", None
+        )
+        if retrieve_next_token is None or retrieve_next_sibling is None:
+            return None
+
+        retrieve_next_token = retrieve_next_token[:batch_size, :seq_len].to(torch.long)
+        retrieve_next_sibling = retrieve_next_sibling[:batch_size, :seq_len].to(
+            torch.long
+        )
+        parent_tokens = torch.full_like(retrieve_next_token, -1)
+        batch_indices = torch.arange(
+            batch_size, dtype=torch.long, device=retrieve_next_token.device
+        )
+
+        for step in range(seq_len):
+            child = retrieve_next_token[:, step]
+            valid_child = (child >= 0) & (child < seq_len)
+            parent_tokens[batch_indices[valid_child], child[valid_child]] = step
+
+            sibling = retrieve_next_sibling[:, step]
+            valid_sibling = (sibling >= 0) & (sibling < seq_len)
+            parent_tokens[batch_indices[valid_sibling], sibling[valid_sibling]] = (
+                parent_tokens[batch_indices[valid_sibling], step]
+            )
+
+        retrieve_parent_token = getattr(
+            forward_metadata, "retrieve_parent_token", None
+        )
+        if retrieve_parent_token is not None:
+            retrieve_parent_token[:batch_size, :seq_len].copy_(
+                parent_tokens.to(dtype=retrieve_parent_token.dtype)
+            )
+
+        return parent_tokens
+
     def _init_track_conv_indices(
         self, query_start_loc: torch.Tensor, forward_batch: ForwardBatch
     ):
@@ -1678,16 +1729,36 @@ class SimpleGLAAttnBackend(MambaAttnBackendBase):
             k_steps = k.reshape(batch_size, seq_len, k.shape[2], k.shape[3])
             v_steps = v.reshape(batch_size, seq_len, v.shape[2], v.shape[3])
 
+            parent_tokens = self._build_tree_parent_tokens(batch_size, seq_len)
+            batch_indices = torch.arange(
+                batch_size, dtype=torch.long, device=q_steps.device
+            )
             state = initial_state
             outputs = []
             for step in range(seq_len):
+                step_state = state
+                if parent_tokens is not None:
+                    if step == 0:
+                        step_state = initial_state
+                    else:
+                        parent_step = parent_tokens[:, step]
+                        valid_parent = (parent_step >= 0) & (parent_step < step)
+                        step_state = initial_state.clone()
+                        valid_batch = batch_indices[valid_parent]
+                        step_state[valid_batch] = mamba_caches.intermediate_ssm[
+                            cache_idx,
+                            valid_batch,
+                            parent_step[valid_parent],
+                        ].to(initial_state.dtype, copy=False)
+                        step_state = step_state.contiguous()
+
                 o_step, state = fused_recurrent_simple_gla(
                     q=q_steps[:, step : step + 1],
                     k=k_steps[:, step : step + 1],
                     v=v_steps[:, step : step + 1],
                     g_gamma=g_gamma,
                     scale=scale,
-                    initial_state=state,
+                    initial_state=step_state,
                     output_final_state=True,
                 )
                 mamba_caches.intermediate_ssm[cache_idx, :batch_size, step] = state.to(
