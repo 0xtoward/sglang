@@ -40,6 +40,8 @@ python -m sglang.launch_server --model-path <model> \
 | `--enable-kvpress` | turn on compression |
 | `--kvpress-method` | `knorm` (default) / `random` / `streamingllm` / `keydiff` / `lagkv` |
 | `--kvpress-compression-ratio` | fraction of prefill tokens to drop (0.0–1.0; 0.3 = keep 70%) |
+| `--kvpress-batched` | use stacked-gather + layer-vectorized score; same kept-set, ~10× fewer kernel launches |
+| `--kvpress-per-head` | each KV head keeps its OWN top-`n_kept` tokens (J → 1.0 vs NV per-head); implies `--kvpress-batched` |
 
 **Required companions** (asserted / auto-enforced in `Scheduler.__init__`): `--disable-radix-cache`,
 `--disable-cuda-graph`, and the overlap scheduler is forced off. KVPress also rejects MLA/NSA models.
@@ -117,14 +119,14 @@ Consequence, measured: on **long / redundant** contexts and for **positional** p
 choices — the *quality* degrades equally (compression hurts both), but the *tokens kept* differ. This
 is a property of the paged pool, not a bug.
 
-> **Could per-head be done?** Yes, for a *uniform* per-head budget: pack each head's kept tokens into
-> its own column of a dense `[n_kept, heads, dim]` block. Because SGLang stores K **post-RoPE**, the
-> physical row index carries no meaning and the existing attention kernel (each head reads its own
-> column) works unchanged — so this would reach Jaccard 1.0 at the same memory. It is **not
-> implemented**: the gain over the current single-set design is bounded (parity is already 0.99) and it
-> complicates compaction. *Variable* per-head budgets (AdaKV) are a different story — see
-> [design notes](../../../../../../../KVPRESS_DESIGN_NOTES.md): they would either negate the memory
-> savings (pad-to-max) or require forking the whole memory subsystem; **not recommended**.
+> **Per-head packing IS implemented as an opt-in switch (`--kvpress-per-head`)**: each KV head keeps
+> its own top-`n_kept` tokens at a uniform budget. SGLang stores K post-RoPE, so the physical row
+> index is just a storage address — head `h` and head `h'` can independently hold different source
+> tokens in their own column of row `r`, and the attention kernel (which reads each head's column with
+> its own RoPE'd query) needs no change. Reaches NV per-head behavior at the same compression ratio
+> and same memory. (*Variable* per-head budgets — AdaKV — are a different story: they would either
+> negate the memory savings (pad-to-max) or require forking the whole memory subsystem; **not
+> recommended**, see [design notes](../../../../../../../KVPRESS_DESIGN_NOTES.md).)
 
 ### Other constraints
 - **RadixCache off:** a compressed prefix is request-specific and its slot→token map is renumbered, so
@@ -141,6 +143,40 @@ is a property of the paged pool, not a bug.
   supports it.)
 
 ---
+
+## Performance (compaction step, TinyLlama-class, num_valid=600, ratio=0.3)
+
+Micro-benchmark of the post-prefill compression on the A800 (torch.profiler kernel counts):
+
+| mode | flag | CUDA kernel launches | GPU µs | wall ms |
+|---|---|---|---|---|
+| current (per-layer loop) | default | 135 | 1172 | 1.752 |
+| batched single-set | `--kvpress-batched` | **8** | 300 | **0.161** |
+| per-head packing | `--kvpress-per-head` | 52 | 1074 | 0.790 |
+
+`batched` is **same kept-set as default, ~11× faster wall** (kernel-launch-bound is collapsed). `per_head`
+is ~2× faster than default *and* reaches NV per-head selection.
+
+## Per-mode quality (3-mode e2e, ROUGE-L vs NV reference / vs full model)
+
+Short dense prompt (DEFAULT_PROMPT, ratio=0.3, 64 new tokens) — the case that stresses
+the single-set vs per-head difference:
+
+| press | single → NV | batched → NV | **per_head → NV** | single → full | **per_head → full** |
+|---|---|---|---|---|---|
+| knorm | 0.458 | 0.458 | **0.652** | 0.449 | 0.465 |
+| streamingllm | 0.997 | 0.997 | 0.997 | 0.541 | 0.541 |
+| keydiff | 0.485 | 0.485 | 0.500 | 0.567 | **0.721** |
+| lagkv | 0.997 | 0.997 | 0.997 | 0.541 | 0.541 |
+
+Long redundant context (`The quick brown fox…`×40 — see `kvpress_e2e_parity.py`): all three modes
+already reach **D~B ≈ 0.99** across presses (single-set is enough when redundancy is high). Per-head
+matters when context is short and dense (the case above), where it raises the data-dependent presses
+toward NV per-head behavior.
+
+Caveats: streaming/lagkv don't differ between single and per-head because their score is positional
+(all heads pick the same tokens); only knorm/keydiff benefit. `random` per_head selects different
+tokens per head but quality is unchanged (random is a baseline floor).
 
 ## Roadmap (see [KVPRESS_DESIGN_NOTES.md](../../../../../../../KVPRESS_DESIGN_NOTES.md) for full analyses)
 

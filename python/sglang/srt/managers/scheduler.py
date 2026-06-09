@@ -325,6 +325,11 @@ class Scheduler(
         # KVPress: KV cache compression
         self.enable_kvpress = server_args.enable_kvpress
         self.kvpress_compression_ratio = server_args.kvpress_compression_ratio
+        self.kvpress_per_head = getattr(server_args, "kvpress_per_head", False)
+        # per-head implies batched (the per-head path is always written as a stacked-layer op)
+        self.kvpress_batched = (
+            getattr(server_args, "kvpress_batched", False) or self.kvpress_per_head
+        )
         if self.enable_kvpress:
             # KVPress compacts the paged KV cache after prefill. That is incompatible with:
             #  - RadixCache (compressed cache content is request-specific, not shareable),
@@ -342,7 +347,9 @@ class Scheduler(
             if self.tp_rank == 0:
                 logger.info(
                     f"[KVPress] method={server_args.kvpress_method} "
-                    f"ratio={self.kvpress_compression_ratio}; overlap disabled"
+                    f"ratio={self.kvpress_compression_ratio} "
+                    f"batched={self.kvpress_batched} per_head={self.kvpress_per_head}; "
+                    f"overlap disabled"
                 )
         else:
             self.kvpress_method = None
@@ -1057,12 +1064,15 @@ class Scheduler(
             self._kvpress_compress_single_req(req)
 
     def _kvpress_compress_single_req(self, req):
-        """Keep the top-(1-ratio) prefill tokens by cross-layer-aggregated press score.
+        """Keep the top-(1-ratio) prefill tokens by press score. Three paths:
 
-        Score convention matches NV kvpress: HIGHER score = MORE important = keep. Kept
-        slots are compacted to req_to_token[:n_kept] and pruned slots are freed. Decode then
-        appends at the physical position (see alloc_for_decode), so the cache stays gap-free
-        while seq_lens stays logical for correct RoPE positions.
+        - default (single-set, per-layer loop): the conservative, validated reference path.
+        - batched (--kvpress-batched): one stacked gather + a score vectorized over the layer
+          axis. Same kept-set as default; ~10x fewer kernel launches.
+        - per-head packing (--kvpress-per-head): each KV head independently keeps its top n_kept
+          tokens; rows store different source tokens in different head columns. SGLang stores
+          POST-RoPE K, so the physical row index carries no positional meaning and the kernel
+          (which reads each head's own column) is unchanged. Matches NV per-head selection (J->1.0).
         """
         seq_len = len(req.fill_ids)
         if seq_len == 0:
@@ -1078,15 +1088,33 @@ class Scheduler(
         if n_kept >= num_valid:
             return  # nothing to prune
 
-        # Aggregate the press score across ALL layers (single shared token set; see notes).
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
-        scores = torch.zeros(num_valid, dtype=torch.float32, device=self.device)
-        for layer_id in range(self.model_config.num_hidden_layers):
-            keys = kv_pool.k_buffer[layer_id][valid_slots]
-            values = kv_pool.v_buffer[layer_id][valid_slots]
-            scores += self.kvpress_method.score(
-                layer_id=layer_id, keys=keys, values=values
-            ).float()
+        num_layers = self.model_config.num_hidden_layers
+
+        if self.kvpress_per_head:
+            self._kvpress_pack_per_head(
+                req, kv_pool, num_layers, valid_slots, num_valid, n_kept, kv_indices, seq_len
+            )
+            return
+
+        if self.kvpress_batched:
+            # Stacked gather: K, V become [L, num_valid, H, D] -> one fused score call.
+            K = torch.stack(
+                [kv_pool.k_buffer[l][valid_slots] for l in range(num_layers)], dim=0
+            )
+            V = torch.stack(
+                [kv_pool.v_buffer[l][valid_slots] for l in range(num_layers)], dim=0
+            )
+            scores = self.kvpress_method.score_batched(K, V).float()
+        else:
+            # Default: per-layer loop, cross-layer sum.
+            scores = torch.zeros(num_valid, dtype=torch.float32, device=self.device)
+            for layer_id in range(num_layers):
+                keys = kv_pool.k_buffer[layer_id][valid_slots]
+                values = kv_pool.v_buffer[layer_id][valid_slots]
+                scores += self.kvpress_method.score(
+                    layer_id=layer_id, keys=keys, values=values
+                ).float()
 
         # NV convention: keep the highest-score tokens (no negation).
         kept_local = torch.sort(scores.topk(n_kept).indices).values
@@ -1104,6 +1132,51 @@ class Scheduler(
 
         req.actual_kv_len = n_kept          # live PHYSICAL kv length (grows during decode)
         req.original_prefill_len = seq_len  # logical length (for RoPE positions)
+
+    def _kvpress_pack_per_head(
+        self, req, kv_pool, num_layers, valid_slots, num_valid, n_kept, kv_indices, seq_len
+    ):
+        """Per-head packing: each KV head selects its own n_kept tokens; rows store different
+        tokens in different head columns. Equivalent to NV per-head pruning at uniform budget,
+        with no kernel change because SGLang's K is post-RoPE and the attention kernel reads
+        each head's own column (the physical row index is just a storage address).
+        """
+        H = kv_pool.k_buffer[0].shape[1]   # num_kv_heads on this rank
+        D = kv_pool.k_buffer[0].shape[2]   # head_dim
+
+        # Stacked gather + per-head scoring across all layers in one go.
+        K = torch.stack([kv_pool.k_buffer[l][valid_slots] for l in range(num_layers)], dim=0)
+        V = torch.stack([kv_pool.v_buffer[l][valid_slots] for l in range(num_layers)], dim=0)
+        scores = self.kvpress_method.score_per_head_batched(K, V).float()  # [num_valid, H]
+
+        # Per-head topk: at row r, head h keeps original token kept_idx[r, h].
+        kept_idx = scores.topk(n_kept, dim=0).indices             # [n_kept, H]
+        src_slots = valid_slots[kept_idx]                         # [n_kept, H]
+        dst_slots = valid_slots[:n_kept]                          # [n_kept]; reuse front slots
+
+        # Gather the per-(row, head) selection into a temp, then scatter into dst.
+        # Temp decouples src and dst so any overlap is safe.
+        for l in range(num_layers):
+            kb = kv_pool.k_buffer[l]                              # [slots, H, D]
+            vb = kv_pool.v_buffer[l]
+            idx = src_slots.unsqueeze(-1).expand(-1, -1, D)       # [n_kept, H, D]
+            new_k = torch.gather(kb, 0, idx)                      # [n_kept, H, D]
+            new_v = torch.gather(vb, 0, idx)
+            kb[dst_slots] = new_k
+            vb[dst_slots] = new_v
+
+        # After scatter the data lives in dst_slots = valid_slots[:n_kept]; every other slot
+        # in valid_slots is freeable (its data was either already copied or unneeded).
+        slots_to_free = valid_slots[n_kept:]
+        if slots_to_free.numel() > 0:
+            self.token_to_kv_pool_allocator.free(slots_to_free)
+
+        new_row = torch.zeros_like(kv_indices)
+        new_row[:n_kept] = dst_slots
+        self.req_to_token_pool.req_to_token[req.req_pool_idx, :seq_len] = new_row
+
+        req.actual_kv_len = n_kept
+        req.original_prefill_len = seq_len
 
     @DynamicGradMode()
     def event_loop_normal(self):

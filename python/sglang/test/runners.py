@@ -524,6 +524,8 @@ class SRTRunner:
         enable_kvpress: bool = False,
         kvpress_method: str = "knorm",
         kvpress_compression_ratio: float = 0.3,
+        kvpress_batched: bool = False,
+        kvpress_per_head: bool = False,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -573,6 +575,8 @@ class SRTRunner:
             enable_kvpress=enable_kvpress,
             kvpress_method=kvpress_method,
             kvpress_compression_ratio=kvpress_compression_ratio,
+            kvpress_batched=kvpress_batched,
+            kvpress_per_head=kvpress_per_head,
             **spec_kwargs,
         )
 

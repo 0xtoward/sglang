@@ -58,30 +58,54 @@ class BaseCompressionMethod(ABC):
         values: torch.Tensor,
         **kwargs
     ) -> torch.Tensor:
-        """
-        Compute importance scores for each token in the KV cache.
-        
-        Higher scores indicate more important tokens that should be kept.
-        Lower scores indicate less important tokens that can be pruned.
-        
-        Parameters
-        ----------
-        layer_id : int
-            The transformer layer index (0-indexed).
-        keys : torch.Tensor
-            Key tensor with shape [num_tokens, num_kv_heads, head_dim].
-        values : torch.Tensor
-            Value tensor with shape [num_tokens, num_kv_heads, head_dim].
-        **kwargs : dict
-            Additional method-specific parameters.
-            
-        Returns
-        -------
-        torch.Tensor
-            Importance scores with shape [num_tokens].
-            Higher scores = more important tokens.
-        """
+        """Per-token importance score (head-mean), shape [num_tokens]. Higher = keep."""
         raise NotImplementedError
+
+    def score_per_head(
+        self,
+        layer_id: int,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Per-(token, head) importance score, shape [num_tokens, num_kv_heads]. Higher = keep.
+
+        Default fallback: broadcast the head-mean score to every head. Subclasses that
+        admit per-head scoring (knorm, keydiff, random) override this.
+        """
+        s = self.score(layer_id, keys, values, **kwargs)   # [num_tokens]
+        return s.unsqueeze(-1).expand(-1, keys.shape[1])    # [num_tokens, num_kv_heads]
+
+    def score_batched(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Score every layer at once. Input [num_layers, num_tokens, num_kv_heads, head_dim];
+        output [num_tokens] already summed across layers (head-mean). Default falls back to
+        a per-layer loop; overridden by knorm/keydiff for the real fused win.
+        """
+        L = keys.shape[0]
+        total = None
+        for l in range(L):
+            s = self.score(l, keys[l], values[l], **kwargs).float()
+            total = s if total is None else total + s
+        return total
+
+    def score_per_head_batched(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Per-head version of score_batched. Output [num_tokens, num_kv_heads]."""
+        L = keys.shape[0]
+        total = None
+        for l in range(L):
+            s = self.score_per_head(l, keys[l], values[l], **kwargs).float()
+            total = s if total is None else total + s
+        return total
 
 
 @dataclass
@@ -134,17 +158,20 @@ class KnormPress(BaseCompressionMethod):
             L2 norms averaged across heads, shape [num_tokens].
             Higher values indicate more important tokens.
         """
-        # Compute L2 norm across head_dim, then average across num_kv_heads
-        # Shape: [num_tokens, num_kv_heads]
-        key_norms = keys.norm(dim=-1)
+        # NV convention: -||k|| (higher = keep). Head-mean for the per-token API.
+        return -keys.norm(dim=-1).mean(dim=-1)
 
-        # NV-kvpress convention: HIGH-norm keys receive LOW attention and are pruned,
-        # so a higher score must mean "more important = keep" -> return NEGATIVE norm.
-        # (The scheduler keeps top-k by score directly, with no extra negation.)
-        # Shape: [num_tokens]
-        scores = -key_norms.mean(dim=-1)
+    def score_per_head(self, layer_id, keys, values, **kwargs):
+        # [num_tokens, num_kv_heads] — each head ranks its own tokens.
+        return -keys.norm(dim=-1)
 
-        return scores
+    def score_batched(self, keys, values, **kwargs):
+        # keys: [L, T, H, D] -> sum over layers of head-mean -||k||
+        return (-keys.float().norm(dim=-1).mean(dim=-1)).sum(dim=0)
+
+    def score_per_head_batched(self, keys, values, **kwargs):
+        # [T, H], summed across layers
+        return (-keys.float().norm(dim=-1)).sum(dim=0)
 
 
 @dataclass
@@ -191,12 +218,16 @@ class RandomPress(BaseCompressionMethod):
             generator = torch.Generator(device=keys.device)
             generator.manual_seed(self.seed + layer_id)  # Different seed per layer
         
-        # Generate random scores for each token
-        # Shape: [num_tokens]
         num_tokens = keys.shape[0]
-        scores = torch.rand(num_tokens, generator=generator, device=keys.device)
-        
-        return scores
+        return torch.rand(num_tokens, generator=generator, device=keys.device)
+
+    def score_per_head(self, layer_id, keys, values, **kwargs):
+        T, H = keys.shape[0], keys.shape[1]
+        generator = None
+        if self.seed is not None:
+            generator = torch.Generator(device=keys.device)
+            generator.manual_seed(self.seed + layer_id)
+        return torch.rand(T, H, generator=generator, device=keys.device)
 
 
 @dataclass
@@ -454,20 +485,27 @@ class KeyDiffPress(BaseCompressionMethod):
         """
         # keys shape: [num_tokens, num_kv_heads, head_dim]
         
-        # Normalize keys: [num_tokens, num_kv_heads, head_dim]
         normalized_keys = F.normalize(keys, p=2, dim=-1)
-        
-        # Compute average key pattern: [1, num_kv_heads, head_dim]
         anchor = normalized_keys.mean(dim=0, keepdim=True)
-        
-        # Compute cosine similarity: [num_tokens, num_kv_heads]
-        similarity = F.cosine_similarity(normalized_keys, anchor, dim=-1)
-        
-        # Average across heads: [num_tokens]
-        similarity = similarity.mean(dim=-1)
-        
-        # Return negative (lower similarity = higher score = keep)
-        return -similarity
+        similarity = F.cosine_similarity(normalized_keys, anchor, dim=-1)  # [T, H]
+        return -similarity.mean(dim=-1)  # [T]
+
+    def score_per_head(self, layer_id, keys, values, **kwargs):
+        nk = F.normalize(keys, p=2, dim=-1)
+        anchor = nk.mean(dim=0, keepdim=True)
+        return -F.cosine_similarity(nk, anchor, dim=-1)  # [T, H]
+
+    def score_batched(self, keys, values, **kwargs):
+        # keys [L, T, H, D]
+        nk = F.normalize(keys.float(), p=2, dim=-1)
+        anchor = nk.mean(dim=1, keepdim=True)  # [L, 1, H, D]
+        sim = F.cosine_similarity(nk, anchor, dim=-1)  # [L, T, H]
+        return (-sim.mean(dim=-1)).sum(dim=0)  # [T]
+
+    def score_per_head_batched(self, keys, values, **kwargs):
+        nk = F.normalize(keys.float(), p=2, dim=-1)
+        anchor = nk.mean(dim=1, keepdim=True)
+        return (-F.cosine_similarity(nk, anchor, dim=-1)).sum(dim=0)  # [T, H]
 
 
 # Registry of available compression methods

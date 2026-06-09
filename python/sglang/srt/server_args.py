@@ -400,6 +400,8 @@ class ServerArgs:
     enable_kvpress: bool = False
     kvpress_method: str = "knorm"
     kvpress_compression_ratio: float = 0.3
+    kvpress_batched: bool = False    # opt-in: stacked-gather + layer-vectorized score (~10x compact)
+    kvpress_per_head: bool = False   # opt-in: each kv-head keeps its own top-n_kept tokens (J->1.0)
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
@@ -2584,6 +2586,18 @@ class ServerArgs:
             type=float,
             default=ServerArgs.kvpress_compression_ratio,
             help="KVPress compression ratio (0.0-1.0). Higher values mean more aggressive compression.",
+        )
+        parser.add_argument(
+            "--kvpress-batched",
+            action="store_true",
+            help="KVPress: use the batched compact path (stacked gather + layer-vectorized score). "
+                 "Same kept-set as the default loop, ~10x fewer kernel launches; recommended.",
+        )
+        parser.add_argument(
+            "--kvpress-per-head",
+            action="store_true",
+            help="KVPress: each kv-head keeps its own top-(1-ratio) tokens (J->1.0 vs NV per-head). "
+                 "Implies --kvpress-batched. Default off; the shared single-token-set path is used.",
         )
         parser.add_argument(
             "--cuda-graph-max-bs",
