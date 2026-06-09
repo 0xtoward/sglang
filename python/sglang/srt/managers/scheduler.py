@@ -1136,37 +1136,46 @@ class Scheduler(
     def _kvpress_pack_per_head(
         self, req, kv_pool, num_layers, valid_slots, num_valid, n_kept, kv_indices, seq_len
     ):
-        """Per-head packing: each KV head selects its own n_kept tokens; rows store different
-        tokens in different head columns. Equivalent to NV per-head pruning at uniform budget,
-        with no kernel change because SGLang's K is post-RoPE and the attention kernel reads
-        each head's own column (the physical row index is just a storage address).
+        """Per-(LAYER, HEAD) packing — full NV-equivalent freedom on the paged pool.
+
+        Why this works on SGLang's pool: `k_buffer` is a per-layer LIST of independent
+        tensors `[slots, heads, dim]`. The slot id from `req_to_token` is just a row
+        index that's REUSED across layers' buffers; the K value stored at (layer L,
+        slot s, head h) is fully independent of what's stored at (layer L', slot s,
+        head h). So layer L and layer L' may pick DIFFERENT source tokens for the same
+        (slot row, head column) — exactly NV's per-(layer, head) selection — and the
+        existing attention kernel (which only reads each layer's own buffer at the
+        given slot, with its own RoPE'd query) needs no change. Stored K is post-RoPE
+        by its ORIGINAL position, so each layer's attention dot product still resolves
+        the correct relative position automatically.
         """
         H = kv_pool.k_buffer[0].shape[1]   # num_kv_heads on this rank
         D = kv_pool.k_buffer[0].shape[2]   # head_dim
 
-        # Stacked gather + per-head scoring across all layers in one go.
+        # One stacked gather across all layers, then per-LAYER per-HEAD scoring.
         K = torch.stack([kv_pool.k_buffer[l][valid_slots] for l in range(num_layers)], dim=0)
         V = torch.stack([kv_pool.v_buffer[l][valid_slots] for l in range(num_layers)], dim=0)
-        scores = self.kvpress_method.score_per_head_batched(K, V).float()  # [num_valid, H]
+        # Per-(layer, token, head) scores [L, T, H] — NO cross-layer reduction.
+        scores = self.kvpress_method.score_per_head_per_layer_batched(K, V).float()
 
-        # Per-head topk: at row r, head h keeps original token kept_idx[r, h].
-        kept_idx = scores.topk(n_kept, dim=0).indices             # [n_kept, H]
-        src_slots = valid_slots[kept_idx]                         # [n_kept, H]
-        dst_slots = valid_slots[:n_kept]                          # [n_kept]; reuse front slots
+        # Per-(layer, head) topk: at layer L, row r, head h -> kept_idx[L, r, h].
+        kept_idx = scores.topk(n_kept, dim=1).indices           # [L, n_kept, H]
+        dst_slots = valid_slots[:n_kept]                        # [n_kept]; same dst row range every layer
 
-        # Gather the per-(row, head) selection into a temp, then scatter into dst.
-        # Temp decouples src and dst so any overlap is safe.
+        # Gather each layer's per-(row, head) selection into a temp, scatter into dst.
+        # Each layer chooses INDEPENDENTLY which source token goes at (row r, head h).
         for l in range(num_layers):
-            kb = kv_pool.k_buffer[l]                              # [slots, H, D]
+            src_slots_l = valid_slots[kept_idx[l]]              # [n_kept, H]
+            kb = kv_pool.k_buffer[l]                            # [slots, H, D]
             vb = kv_pool.v_buffer[l]
-            idx = src_slots.unsqueeze(-1).expand(-1, -1, D)       # [n_kept, H, D]
-            new_k = torch.gather(kb, 0, idx)                      # [n_kept, H, D]
+            idx = src_slots_l.unsqueeze(-1).expand(-1, -1, D)   # [n_kept, H, D]
+            new_k = torch.gather(kb, 0, idx)                    # [n_kept, H, D]
             new_v = torch.gather(vb, 0, idx)
             kb[dst_slots] = new_k
             vb[dst_slots] = new_v
 
         # After scatter the data lives in dst_slots = valid_slots[:n_kept]; every other slot
-        # in valid_slots is freeable (its data was either already copied or unneeded).
+        # in valid_slots is freeable (we already copied everything we want).
         slots_to_free = valid_slots[n_kept:]
         if slots_to_free.numel() > 0:
             self.token_to_kv_pool_allocator.free(slots_to_free)

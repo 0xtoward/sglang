@@ -107,6 +107,23 @@ class BaseCompressionMethod(ABC):
             total = s if total is None else total + s
         return total
 
+    def score_per_head_per_layer_batched(
+        self,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Per-(layer, token, head) scores, NO cross-layer reduction. Output [L, T, H].
+        Used by --kvpress-per-head to give each (layer, head) its own topk — the full
+        NV-equivalent per-(layer, head) freedom that SGLang's per-layer independent
+        buffers actually allow.
+        """
+        L = keys.shape[0]
+        outs = []
+        for l in range(L):
+            outs.append(self.score_per_head(l, keys[l], values[l], **kwargs).float())
+        return torch.stack(outs, dim=0)
+
 
 @dataclass
 class KnormPress(BaseCompressionMethod):
@@ -172,6 +189,10 @@ class KnormPress(BaseCompressionMethod):
     def score_per_head_batched(self, keys, values, **kwargs):
         # [T, H], summed across layers
         return (-keys.float().norm(dim=-1)).sum(dim=0)
+
+    def score_per_head_per_layer_batched(self, keys, values, **kwargs):
+        # [L, T, H], NO cross-layer reduction
+        return -keys.float().norm(dim=-1)
 
 
 @dataclass
@@ -506,6 +527,12 @@ class KeyDiffPress(BaseCompressionMethod):
         nk = F.normalize(keys.float(), p=2, dim=-1)
         anchor = nk.mean(dim=1, keepdim=True)
         return (-F.cosine_similarity(nk, anchor, dim=-1)).sum(dim=0)  # [T, H]
+
+    def score_per_head_per_layer_batched(self, keys, values, **kwargs):
+        # [L, T, H], NO cross-layer reduction
+        nk = F.normalize(keys.float(), p=2, dim=-1)
+        anchor = nk.mean(dim=1, keepdim=True)
+        return -F.cosine_similarity(nk, anchor, dim=-1)
 
 
 # Registry of available compression methods

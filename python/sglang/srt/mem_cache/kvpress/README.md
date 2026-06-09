@@ -119,12 +119,14 @@ Consequence, measured: on **long / redundant** contexts and for **positional** p
 choices — the *quality* degrades equally (compression hurts both), but the *tokens kept* differ. This
 is a property of the paged pool, not a bug.
 
-> **Per-head packing IS implemented as an opt-in switch (`--kvpress-per-head`)**: each KV head keeps
-> its own top-`n_kept` tokens at a uniform budget. SGLang stores K post-RoPE, so the physical row
-> index is just a storage address — head `h` and head `h'` can independently hold different source
-> tokens in their own column of row `r`, and the attention kernel (which reads each head's column with
-> its own RoPE'd query) needs no change. Reaches NV per-head behavior at the same compression ratio
-> and same memory. (*Variable* per-head budgets — AdaKV — are a different story: they would either
+> **Per-(layer, head) packing IS implemented as an opt-in switch (`--kvpress-per-head`)** —
+> matches NV's full per-(layer, head) freedom. Each layer's pool buffer `k_buffer[layer]` is an
+> independent tensor; the slot id from `req_to_token` is just a reused row index. So layer `L`
+> and `L'` can hold completely different source tokens at the same `(slot, head)` location, and
+> each layer's attention reads only its own buffer. SGLang stores K post-RoPE (the dot product
+> resolves the right relative position automatically), so the physical row index is just a
+> storage address. End-to-end ROUGE-L vs NV per-(layer, head) selection: **knorm/keydiff 0.998**,
+> streamingllm/lagkv 0.997 (positional presses are head/layer-invariant by construction). (*Variable* per-head budgets — AdaKV — are a different story: they would either
 > negate the memory savings (pad-to-max) or require forking the whole memory subsystem; **not
 > recommended**, see [design notes](../../../../../../../KVPRESS_DESIGN_NOTES.md).)
 
@@ -160,13 +162,13 @@ is ~2× faster than default *and* reaches NV per-head selection.
 ## Per-mode quality (3-mode e2e, ROUGE-L vs NV reference / vs full model)
 
 Short dense prompt (DEFAULT_PROMPT, ratio=0.3, 64 new tokens) — the case that stresses
-the single-set vs per-head difference:
+the single-set vs per-(layer, head) difference:
 
-| press | single → NV | batched → NV | **per_head → NV** | single → full | **per_head → full** |
+| press | single → NV | batched → NV | **per_head → NV** | single → full | per_head → full |
 |---|---|---|---|---|---|
-| knorm | 0.458 | 0.458 | **0.652** | 0.449 | 0.465 |
+| knorm | 0.458 | 0.458 | **0.998** | 0.449 | 0.560 |
 | streamingllm | 0.997 | 0.997 | 0.997 | 0.541 | 0.541 |
-| keydiff | 0.485 | 0.485 | 0.500 | 0.567 | **0.721** |
+| keydiff | 0.485 | 0.485 | **0.998** | 0.567 | 0.474 |
 | lagkv | 0.997 | 0.997 | 0.997 | 0.541 | 0.541 |
 
 Long redundant context (`The quick brown fox…`×40 — see `kvpress_e2e_parity.py`): all three modes

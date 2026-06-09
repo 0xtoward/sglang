@@ -229,10 +229,19 @@ class TritonAttnBackend(AttentionBackend):
 
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None:
-                # KVPress: Use actual_kv_lens for reading KV cache (physical length)
-                # while seq_lens remains as logical length for position_ids
-                kv_lens = forward_batch.actual_kv_lens if forward_batch.actual_kv_lens is not None else forward_batch.seq_lens
-                kv_lens_sum = kv_lens.sum().item() if forward_batch.actual_kv_lens is not None else forward_batch.seq_lens_sum
+                # KVPress: physical kv length for the attention read; logical seq_lens is
+                # still used for position_ids (kept by the caller).
+                # Optimization c: read the host-side sum off ForwardBatch instead of doing
+                # a per-step `kv_lens.sum().item()` D->H sync (which serialized the launch).
+                if forward_batch.actual_kv_lens is not None:
+                    kv_lens = forward_batch.actual_kv_lens
+                    kv_lens_sum = forward_batch.actual_kv_lens_sum
+                    assert kv_lens_sum is not None, (
+                        "actual_kv_lens set but actual_kv_lens_sum missing (opt c invariant)."
+                    )
+                else:
+                    kv_lens = forward_batch.seq_lens
+                    kv_lens_sum = forward_batch.seq_lens_sum
                 
                 kv_indptr[1 : bs + 1] = torch.cumsum(kv_lens, dim=0)
                 kv_indptr = kv_indptr[: bs + 1]

@@ -1628,6 +1628,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # LIVE compacted length (n_kept after prefill, advanced by alloc_for_decode on
         # every decode step), so it already includes decode tokens. Normal reqs use the
         # (logical == physical) seq_len.
+        # `actual_kv_lens_sum` is the host-side total used by the attention backend to size
+        # kv_indices, avoiding a per-step `kv_lens.sum().item()` D->H sync (optimization c).
         if any(req.actual_kv_len is not None for req in self.reqs):
             lens = [
                 req.actual_kv_len
@@ -1638,8 +1640,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.actual_kv_lens = torch.tensor(
                 lens, dtype=torch.int32, device=self.device
             )
+            self.actual_kv_lens_sum = sum(lens)
         else:
             self.actual_kv_lens = None
+            self.actual_kv_lens_sum = None
 
     def maybe_wait_verify_done(self):
         if self.is_v2_eagle:
@@ -1794,6 +1798,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             seq_lens_cpu=seq_lens_cpu,
             seq_lens_sum=self.seq_lens_sum,
             actual_kv_lens=getattr(self, "actual_kv_lens", None),
+            actual_kv_lens_sum=getattr(self, "actual_kv_lens_sum", None),
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,
             token_ids_logprobs=self.token_ids_logprobs,
@@ -1965,3 +1970,6 @@ class ModelWorkerBatch:
     # KVPress: physical (compacted) KV cache lengths; differs from logical seq_lens.
     # Propagated to ForwardBatch so the attention backend reads the correct KV range.
     actual_kv_lens: Optional[torch.Tensor] = None
+    # Host-side sum of actual_kv_lens (optimization c): lets the attention backend size
+    # kv_indices without a D->H .item() sync.
+    actual_kv_lens_sum: Optional[int] = None
