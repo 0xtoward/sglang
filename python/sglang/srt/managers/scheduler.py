@@ -2010,7 +2010,10 @@ class Scheduler(
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # opt e: drain the previous iter's deferred prefill batch first (now compacted).
-        if self.enable_kvpress and self._kvpress_deferred_merge is not None:
+        # Quarantine only matters under overlap (where the look-ahead alloc races compaction).
+        # Under non-overlap, processing is immediate so we never enter this path.
+        if (self.enable_kvpress and self.enable_overlap
+                and self._kvpress_deferred_merge is not None):
             deferred = self._kvpress_deferred_merge
             self._kvpress_deferred_merge = None
             deferred.filter_batch()
@@ -2050,9 +2053,10 @@ class Scheduler(
             # Merge the new batch into the running batch.
             # For prefill-only batch, we can avoid going through decoding step.
             if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
-                if self.enable_kvpress:
+                if self.enable_kvpress and self.enable_overlap:
                     # opt e: stash for next-iter merge so compaction (firing later this iter)
                     # can't race against the metadata snapshot of these reqs' first decode.
+                    # Only needed under overlap; non-overlap processes immediately, no race.
                     self._kvpress_deferred_merge = self.last_batch
                 elif self.running_batch.is_empty():
                     self.running_batch = self.last_batch
