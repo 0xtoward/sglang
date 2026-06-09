@@ -266,36 +266,43 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             if self.enable_overlap and req.finished():
-                if self.page_size == 1:
-                    if batch.spec_algorithm.is_eagle():
-                        from sglang.srt.speculative.eagle_worker_v2 import (
-                            free_spec_dec_tokens_page_size_1,
-                        )
+                # KVPress overlap fix (opt e): for a compressed req, cache_finished_req
+                # in the iter where finish was DETECTED already freed everything up to
+                # the LIVE actual_kv_len — which under overlap includes the slot that
+                # the look-ahead's prepare_for_decode alloc'd for this req. So we must
+                # NOT also free batch.out_cache_loc[i:i+1] here; that would double-free.
+                # Non-kvpress reqs follow the usual extra-delayed-token convention.
+                if req.actual_kv_len is None:
+                    if self.page_size == 1:
+                        if batch.spec_algorithm.is_eagle():
+                            from sglang.srt.speculative.eagle_worker_v2 import (
+                                free_spec_dec_tokens_page_size_1,
+                            )
 
-                        free_spec_dec_tokens_page_size_1(
-                            self.req_to_token_pool,
-                            self.token_to_kv_pool_allocator,
-                            req,
-                            last_batch_allocate_lens_cpu[i],
-                            None,
-                        )
-                    else:
-                        # Free the one extra delayed token
-                        self.token_to_kv_pool_allocator.free(
-                            batch.out_cache_loc[i : i + 1]
-                        )
-                else:
-                    if batch.spec_algorithm.is_eagle():
-                        # TODO(lsyin): support eagle with page_size > 1
-                        raise NotImplementedError()
-                    else:
-                        if (
-                            len(req.origin_input_ids) + len(req.output_ids) - 1
-                        ) % self.page_size == 0:
-                            # Only free when the extra token is in a new page
+                            free_spec_dec_tokens_page_size_1(
+                                self.req_to_token_pool,
+                                self.token_to_kv_pool_allocator,
+                                req,
+                                last_batch_allocate_lens_cpu[i],
+                                None,
+                            )
+                        else:
+                            # Free the one extra delayed token
                             self.token_to_kv_pool_allocator.free(
                                 batch.out_cache_loc[i : i + 1]
                             )
+                    else:
+                        if batch.spec_algorithm.is_eagle():
+                            # TODO(lsyin): support eagle with page_size > 1
+                            raise NotImplementedError()
+                        else:
+                            if (
+                                len(req.origin_input_ids) + len(req.output_ids) - 1
+                            ) % self.page_size == 0:
+                                # Only free when the extra token is in a new page
+                                self.token_to_kv_pool_allocator.free(
+                                    batch.out_cache_loc[i : i + 1]
+                                )
                 continue
 
             if batch.spec_algorithm.is_none():

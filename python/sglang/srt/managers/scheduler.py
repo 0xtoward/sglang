@@ -330,18 +330,17 @@ class Scheduler(
         self.kvpress_batched = (
             getattr(server_args, "kvpress_batched", False) or self.kvpress_per_head
         )
+        # opt e attempt: quarantine — just-prefilled reqs sit out one iter so the metadata
+        # snapshot for their first decode can't race ahead of the (post-prefill) compaction.
+        self._kvpress_deferred_merge: Optional["ScheduleBatch"] = None
         if self.enable_kvpress:
-            # KVPress compacts the paged KV cache after prefill. That is incompatible with:
+            # KVPress compacts the paged KV cache after prefill. Incompatible with:
             #  - RadixCache (compressed cache content is request-specific, not shareable),
-            #  - CUDA graphs (per-request physical lengths become dynamic),
-            #  - the one-step-ahead overlap scheduler (it speculatively allocates decode
-            #    slots, which double-free against the compacted physical layout — or, more
-            #    insidiously, silently produces wrong outputs because lookahead state and
-            #    compacted state get out of sync; measured directly with the 3-mode harness).
+            #  - CUDA graphs (per-request physical lengths become dynamic).
+            # The overlap scheduler is being re-enabled BEHIND the deferred-merge quarantine
+            # (opt e, under test). Allocator tracing via SGLANG_KVPRESS_TRACE_ALLOC=1.
             assert server_args.disable_radix_cache, "KVPress requires --disable-radix-cache"
             assert server_args.disable_cuda_graph, "KVPress requires --disable-cuda-graph"
-            server_args.disable_overlap_schedule = True
-            self.enable_overlap = False
             self.kvpress_method = get_compression_method(
                 method_name=server_args.kvpress_method,
                 compression_ratio=self.kvpress_compression_ratio,
@@ -2010,6 +2009,16 @@ class Scheduler(
         )
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
+        # opt e: drain the previous iter's deferred prefill batch first (now compacted).
+        if self.enable_kvpress and self._kvpress_deferred_merge is not None:
+            deferred = self._kvpress_deferred_merge
+            self._kvpress_deferred_merge = None
+            deferred.filter_batch()
+            if not deferred.is_empty():
+                if self.running_batch.is_empty():
+                    self.running_batch = deferred
+                else:
+                    self.running_batch.merge_batch(deferred)
         # Merge the prefill batch into the running batch
         chunked_req_to_exclude = set()
         if self.chunked_req:
@@ -2041,7 +2050,11 @@ class Scheduler(
             # Merge the new batch into the running batch.
             # For prefill-only batch, we can avoid going through decoding step.
             if not self.last_batch.is_empty() and not self.last_batch.is_prefill_only:
-                if self.running_batch.is_empty():
+                if self.enable_kvpress:
+                    # opt e: stash for next-iter merge so compaction (firing later this iter)
+                    # can't race against the metadata snapshot of these reqs' first decode.
+                    self._kvpress_deferred_merge = self.last_batch
+                elif self.running_batch.is_empty():
                     self.running_batch = self.last_batch
                 else:
                     # Merge running_batch with prefill batch
