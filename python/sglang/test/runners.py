@@ -69,6 +69,8 @@ NUM_TOP_LOGPROBS = 5
 def get_dtype_str(torch_dtype):
     if torch_dtype is torch.float16:
         return "float16"
+    if torch_dtype is torch.bfloat16:
+        return "bfloat16"
     if torch_dtype is torch.float32:
         return "float32"
     else:

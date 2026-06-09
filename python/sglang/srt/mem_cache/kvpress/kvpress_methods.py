@@ -137,11 +137,13 @@ class KnormPress(BaseCompressionMethod):
         # Compute L2 norm across head_dim, then average across num_kv_heads
         # Shape: [num_tokens, num_kv_heads]
         key_norms = keys.norm(dim=-1)
-        
-        # Average across heads to get per-token score
+
+        # NV-kvpress convention: HIGH-norm keys receive LOW attention and are pruned,
+        # so a higher score must mean "more important = keep" -> return NEGATIVE norm.
+        # (The scheduler keeps top-k by score directly, with no extra negation.)
         # Shape: [num_tokens]
-        scores = key_norms.mean(dim=-1)
-        
+        scores = -key_norms.mean(dim=-1)
+
         return scores
 
 

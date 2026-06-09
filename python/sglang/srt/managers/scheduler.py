@@ -326,15 +326,23 @@ class Scheduler(
         self.enable_kvpress = server_args.enable_kvpress
         self.kvpress_compression_ratio = server_args.kvpress_compression_ratio
         if self.enable_kvpress:
-            # Initialize compression method from server args
+            # KVPress compacts the paged KV cache after prefill. That is incompatible with:
+            #  - RadixCache (compressed cache content is request-specific, not shareable),
+            #  - CUDA graphs (per-request physical lengths become dynamic),
+            #  - the one-step-ahead overlap scheduler (it speculatively allocates decode
+            #    slots, which double-free against the compacted physical layout).
+            assert server_args.disable_radix_cache, "KVPress requires --disable-radix-cache"
+            assert server_args.disable_cuda_graph, "KVPress requires --disable-cuda-graph"
+            server_args.disable_overlap_schedule = True
+            self.enable_overlap = False
             self.kvpress_method = get_compression_method(
                 method_name=server_args.kvpress_method,
-                compression_ratio=self.kvpress_compression_ratio
+                compression_ratio=self.kvpress_compression_ratio,
             )
             if self.tp_rank == 0:
                 logger.info(
-                    f"[KVPress] Initialized compression method: {server_args.kvpress_method} "
-                    f"with ratio {self.kvpress_compression_ratio}"
+                    f"[KVPress] method={server_args.kvpress_method} "
+                    f"ratio={self.kvpress_compression_ratio}; overlap disabled"
                 )
         else:
             self.kvpress_method = None
@@ -1032,207 +1040,70 @@ class Scheduler(
 
     # ===== KVPress: KV Cache Compression =====
     def _kvpress_compress_and_free(self, batch):
+        """Compress each request's prefill KV cache after prefill (per-token, NV-aligned).
+
+        SGLang's paged pool shares one slot across all layers and heads, so unlike NVIDIA
+        kvpress (per-head, per-layer pruning) we can only drop WHOLE tokens with a single
+        token set shared across layers. The press score is therefore aggregated across all
+        layers and the globally most important tokens are kept.
         """
-        Compress KV cache for all requests in the batch after prefill.
-        This implements KnormPress (Key norm-based compression).
-        """
-        if self.kvpress_compression_ratio <= 0:
+        if self.kvpress_compression_ratio <= 0 or len(batch.reqs) == 0:
             return
-        
-        if len(batch.reqs) == 0:
-            return
-        
-        if self.tp_rank == 0:
-            logger.info(f"[KVPress] Checking {len(batch.reqs)} requests for compression")
-        
-        # Track which requests were compressed
-        compressed_indices = []
-        
-        for i, req in enumerate(batch.reqs):
-            # Skip requests that don't need compression
-            if (req.is_retracted or 
-                req.finished() or 
-                req.is_chunked > 0):
-                if self.tp_rank == 0:
-                    logger.info(f"[KVPress] Skip req {req.rid}: retracted={req.is_retracted}, finished={req.finished()}, chunked={req.is_chunked}")
+        for req in batch.reqs:
+            if req.is_retracted or req.finished() or req.is_chunked > 0:
                 continue
-            
-            # Only compress if this request hasn't been compressed yet
-            if req.actual_kv_len is not None:
-                if self.tp_rank == 0:
-                    logger.info(f"[KVPress] Skip req {req.rid}: already compressed")
+            if req.actual_kv_len is not None:  # already compressed
                 continue
-            
             self._kvpress_compress_single_req(req)
-            
-            # Track this request for seq_lens update
-            if req.actual_kv_len is not None:
-                compressed_indices.append(i)
-        
-        # Note: We do NOT update seq_lens here to avoid breaking RoPE position calculation.
-        # seq_lens must remain as logical length for correct position IDs.
-        # The compressed KV cache will be read correctly because req_to_token only
-        # has valid slots in the first n_kept positions, and zeros in the rest.
-        # Attention kernels will naturally skip zero slots during gather operations.
-    
+
     def _kvpress_compress_single_req(self, req):
+        """Keep the top-(1-ratio) prefill tokens by cross-layer-aggregated press score.
+
+        Score convention matches NV kvpress: HIGHER score = MORE important = keep. Kept
+        slots are compacted to req_to_token[:n_kept] and pruned slots are freed. Decode then
+        appends at the physical position (see alloc_for_decode), so the cache stays gap-free
+        while seq_lens stays logical for correct RoPE positions.
         """
-        Compress KV cache for a single request using per-layer KnormPress method.
-        
-        Key Strategy:
-        - Each layer independently selects its top-k important tokens based on key norms
-        - All layers write their compressed KV to the same set of slots (in-place)
-        - Uses temporary buffers to avoid read-write conflicts
-        - Breaks the 1:1 correspondence between logical position and physical token
-          (different layers store different tokens at the same slot positions)
-        
-        Steps:
-        1. Get slot_ids for this request's prefill tokens
-        2. Calculate n_kept (compression target)
-        3. For each layer:
-           a. Compute importance scores (key norms) for that layer
-           b. Select top-k tokens for that layer
-           c. Copy selected tokens to temporary buffer
-           d. Write back to the first n_kept slots (in-place)
-        4. Free slots beyond n_kept (all layers done)
-        5. Update req_to_token mapping (only keep first n_kept slots)
-        6. Update req metadata for memory release
-        """
-        # 1. Get slot_ids for prefill tokens
         seq_len = len(req.fill_ids)
-        
-        if self.tp_rank == 0:
-            logger.info(f"[KVPress] Processing req {req.rid}: seq_len={seq_len}")
-        
         if seq_len == 0:
-            if self.tp_rank == 0:
-                logger.info(f"[KVPress] Skip req {req.rid}: empty seq_len")
             return
-        
-        # Get ALL kv_indices for this request (from position 0 to seq_len)
-        kv_indices = self.req_to_token_pool.req_to_token[
-            req.req_pool_idx, :seq_len
-        ].clone()  # Clone to avoid modifying the original
-        
-        # Find valid (non-zero) indices
+        req_to_token = self.req_to_token_pool.req_to_token
+        kv_indices = req_to_token[req.req_pool_idx, :seq_len]
         valid_mask = kv_indices != 0
-        num_valid_tokens = valid_mask.sum().item()
-        
-        if num_valid_tokens == 0:
-            if self.tp_rank == 0:
-                logger.info(f"[KVPress] Skip req {req.rid}: no valid kv_indices")
+        valid_slots = kv_indices[valid_mask]
+        num_valid = valid_slots.numel()
+        if num_valid == 0:
             return
-        
-        if self.tp_rank == 0:
-            logger.info(
-                f"[KVPress] Found {num_valid_tokens} valid KV tokens to compress: "
-                f"all_kv_indices={kv_indices.tolist()}"
-            )
-        
-        # 2. Calculate n_kept (compression target)
-        n_kept = max(1, int(num_valid_tokens * (1 - self.kvpress_compression_ratio)))
-        
-        # Access KV buffer from token_to_kv_pool
+        n_kept = max(1, int(num_valid * (1 - self.kvpress_compression_ratio)))
+        if n_kept >= num_valid:
+            return  # nothing to prune
+
+        # Aggregate the press score across ALL layers (single shared token set; see notes).
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
-        
-        # Get KV buffer shapes for temporary buffers
-        # k_buffer shape: [total_slots, num_kv_heads, head_dim]
-        num_kv_heads = self.model_config.num_key_value_heads // self.tp_size
-        head_dim = self.model_config.head_dim
-        
-        # 3. Per-layer compression with temporary buffers
-        valid_kv_indices = kv_indices[valid_mask]
-        
-        # Create temporary buffers (only need single-layer size)
-        temp_k = torch.empty(
-            n_kept, num_kv_heads, head_dim,
-            device=self.device,
-            dtype=kv_pool.k_buffer[0].dtype
-        )
-        temp_v = torch.empty(
-            n_kept, num_kv_heads, head_dim,
-            device=self.device,
-            dtype=kv_pool.v_buffer[0].dtype
-        )
-        
-        # Track pruned slots (will be same across all layers since n_kept is fixed)
-        slots_to_free = None
-        
+        scores = torch.zeros(num_valid, dtype=torch.float32, device=self.device)
         for layer_id in range(self.model_config.num_hidden_layers):
-            k_buffer = kv_pool.k_buffer[layer_id]
-            v_buffer = kv_pool.v_buffer[layer_id]
-            
-            # 3a. Compute importance scores for this layer using the compression method
-            # Shape: [num_valid_tokens, num_kv_heads, head_dim]
-            layer_keys = k_buffer[valid_kv_indices]
-            layer_values = v_buffer[valid_kv_indices]
-            
-            # Use pluggable compression method to compute scores
-            # Shape: [num_valid_tokens]
-            layer_scores = self.kvpress_method.score(
-                layer_id=layer_id,
-                keys=layer_keys,
-                values=layer_values
-            )
-            
-            # Create full score array with -inf for invalid positions
-            token_scores = torch.full(
-                (len(kv_indices),), float('-inf'),
-                device=self.device, dtype=torch.float32
-            )
-            token_scores[valid_mask] = -layer_scores.float()  # Negate and convert to float32
-            
-            # 3b. Select top-k tokens for this layer
-            kept_indices_layer = token_scores.topk(n_kept).indices
-            
-            # 3c. Get the slot_ids of selected tokens
-            kept_slots = kv_indices[kept_indices_layer]
-            
-            # 3d. Copy selected tokens to temporary buffer
-            temp_k[:] = k_buffer[kept_slots]
-            temp_v[:] = v_buffer[kept_slots]
-            
-            # 3e. Write back to the same slots (in-place)
-            # Note: Since we're writing to the same slots we just read from,
-            # this step is technically a no-op, but kept for clarity
-            k_buffer[kept_slots] = temp_k
-            v_buffer[kept_slots] = temp_v
-            
-            # Track which slots to free (same across all layers)
-            if layer_id == 0:
-                # Calculate pruned slots from first layer
-                pruned_mask = torch.ones(len(kv_indices), dtype=torch.bool, device=self.device)
-                pruned_mask[kept_indices_layer] = False
-                slots_to_free = kv_indices[pruned_mask & valid_mask]
-                # Store kept_slots for updating req_to_token later
-                final_kept_slots = kept_slots
-        
-        # 4. Free pruned slots (all layers are done)
-        if self.tp_rank == 0:
-            logger.info(
-                f"[KVPress] Freeing {len(slots_to_free)} pruned slots (kept {n_kept} out of {num_valid_tokens}): "
-                f"slot_ids={slots_to_free.tolist()}"
-            )
-        
-        if len(slots_to_free) > 0:
+            keys = kv_pool.k_buffer[layer_id][valid_slots]
+            values = kv_pool.v_buffer[layer_id][valid_slots]
+            scores += self.kvpress_method.score(
+                layer_id=layer_id, keys=keys, values=values
+            ).float()
+
+        # NV convention: keep the highest-score tokens (no negation).
+        kept_local = torch.sort(scores.topk(n_kept).indices).values
+        keep_mask = torch.zeros(num_valid, dtype=torch.bool, device=self.device)
+        keep_mask[kept_local] = True
+        kept_slots = valid_slots[kept_local]
+        slots_to_free = valid_slots[~keep_mask]
+        if slots_to_free.numel() > 0:
             self.token_to_kv_pool_allocator.free(slots_to_free)
-        
-        # 5. Update req_to_token mapping
-        # Store the selected slot_ids (order doesn't matter for attention)
-        new_mapping = torch.zeros_like(kv_indices)
-        new_mapping[:n_kept] = final_kept_slots
-        self.req_to_token_pool.req_to_token[req.req_pool_idx, :seq_len] = new_mapping
-        
-        # 6. Update Req metadata
-        req.actual_kv_len = n_kept  # Physical length (for memory release)
-        req.original_prefill_len = seq_len  # Logical length (for position calculation)
-        
-        if self.tp_rank == 0:
-            logger.info(
-                f"[KVPress] Compressed req {req.rid}: "
-                f"{num_valid_tokens} -> {n_kept} tokens "
-                f"({(1 - n_kept / num_valid_tokens) * 100:.1f}% reduction)"
-            )
+
+        # Compact kept slots to the front; clear the rest of the logical row.
+        new_row = torch.zeros_like(kv_indices)
+        new_row[:n_kept] = kept_slots
+        req_to_token[req.req_pool_idx, :seq_len] = new_row
+
+        req.actual_kv_len = n_kept          # live PHYSICAL kv length (grows during decode)
+        req.original_prefill_len = seq_len  # logical length (for RoPE positions)
 
     @DynamicGradMode()
     def event_loop_normal(self):

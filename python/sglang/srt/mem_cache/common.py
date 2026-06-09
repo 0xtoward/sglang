@@ -453,6 +453,16 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     else:
         locs = batch.seq_lens.clone()
 
+    # KVPress: a compressed request keeps a compacted, gap-free cache that is shorter
+    # than its logical seq_len. Decode slots must be written at the PHYSICAL position
+    # (req.actual_kv_len) and that length advanced, so kept-prefill + decode stay
+    # contiguous for the attention read (which uses actual_kv_lens, not seq_lens).
+    if any(req.actual_kv_len is not None for req in batch.reqs):
+        for i, req in enumerate(batch.reqs):
+            if req.actual_kv_len is not None:
+                locs[i] = req.actual_kv_len
+                req.actual_kv_len += token_per_req
+
     batch.req_to_token_pool.write(
         (batch.req_pool_indices, locs), out_cache_loc.to(torch.int32)
     )

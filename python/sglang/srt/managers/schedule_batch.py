@@ -1502,33 +1502,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.offload_kv_cache(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             )
-        
-        # KVPress: Calculate actual length for memory release
-        # If KVPress was applied, actual_kv_len tracks the compressed length
-        # Otherwise, use the logical seq_lens_cpu[idx]
+
+        # KVPress: a compressed request holds a compacted physical cache of req.actual_kv_len
+        # slots (kept prefill + decode); a normal request uses its logical length.
         if req.actual_kv_len is not None:
-            # actual_kv_len = prefix_len + compressed_len (set during prefill)
-            # Now we add decode length: len(output_ids)
-            actual_len = req.actual_kv_len + len(req.output_ids)
+            actual_len = req.actual_kv_len
         else:
-            # Normal request without compression
             actual_len = seq_lens_cpu[idx]
-        
+
         if isinstance(self.tree_cache, ChunkCache):
             # ChunkCache does not have eviction
             token_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, : actual_len
+                req.req_pool_idx, :actual_len
             ]
-            # Debug: log what we're about to free
-            logger.info(
-                f"[KVPress Debug] release_req for {req.rid}: "
-                f"actual_len={actual_len}, token_indices_before_filter={token_indices.tolist()[:10]}"
-            )
-            # Filter out zeros (compressed/pruned slots)
-            token_indices = token_indices[token_indices != 0]
-            logger.info(
-                f"[KVPress Debug] release_req freeing {len(token_indices)} slots: {token_indices.tolist()}"
-            )
             self.token_to_kv_pool_allocator.free(token_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
         else:
@@ -1537,19 +1523,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 len(req.prefix_indices) // server_args.page_size
             ) * server_args.page_size
             token_indices = self.req_to_token_pool.req_to_token[
-                req.req_pool_idx, last_uncached_pos : actual_len
+                req.req_pool_idx, last_uncached_pos:actual_len
             ]
-            # Debug: log what we're about to free
-            logger.info(
-                f"[KVPress Debug] release_req (RadixCache) for {req.rid}: "
-                f"actual_len={actual_len}, last_uncached_pos={last_uncached_pos}, "
-                f"token_indices_before_filter={token_indices.tolist()[:10]}"
-            )
-            # Filter out zeros (compressed/pruned slots)
-            token_indices = token_indices[token_indices != 0]
-            logger.info(
-                f"[KVPress Debug] release_req (RadixCache) freeing {len(token_indices)} slots: {token_indices.tolist()}"
-            )
             self.token_to_kv_pool_allocator.free(token_indices)
             self.req_to_token_pool.free(req.req_pool_idx)
 
@@ -1562,8 +1537,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # NOTE(lsyin): we should use the newly evictable memory instantly.
             num_tokens = remaing_req_count * global_config.retract_decode_steps
             self._evict_tree_cache_if_needed(num_tokens)
-
-        req.reset_for_retract()
 
     def prepare_encoder_info_decode(self):
         # Reset the encoder cached status
@@ -1651,17 +1624,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # KVPress: Calculate actual KV cache lengths for compressed requests
         # actual_kv_lens is used by attention backend to read the correct KV range
         # seq_lens remains as logical length for position_ids calculation
-        has_compressed = any(req.actual_kv_len is not None for req in self.reqs)
-        if has_compressed:
-            actual_kv_lens_list = []
-            for req in self.reqs:
-                if req.actual_kv_len is not None:
-                    # Compressed request: use physical length
-                    actual_kv_lens_list.append(req.actual_kv_len + len(req.output_ids))
-                else:
-                    # Normal request: physical == logical
-                    actual_kv_lens_list.append(len(req.origin_input_ids) + len(req.output_ids))
-            self.actual_kv_lens = torch.tensor(actual_kv_lens_list, dtype=torch.int32, device=self.device)
+        # KVPress: physical KV length for the attention read. req.actual_kv_len is the
+        # LIVE compacted length (n_kept after prefill, advanced by alloc_for_decode on
+        # every decode step), so it already includes decode tokens. Normal reqs use the
+        # (logical == physical) seq_len.
+        if any(req.actual_kv_len is not None for req in self.reqs):
+            lens = [
+                req.actual_kv_len
+                if req.actual_kv_len is not None
+                else int(self.seq_lens_cpu[i])
+                for i, req in enumerate(self.reqs)
+            ]
+            self.actual_kv_lens = torch.tensor(
+                lens, dtype=torch.int32, device=self.device
+            )
         else:
             self.actual_kv_lens = None
 
@@ -1817,6 +1793,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             out_cache_loc=self.out_cache_loc,
             seq_lens_cpu=seq_lens_cpu,
             seq_lens_sum=self.seq_lens_sum,
+            actual_kv_lens=getattr(self, "actual_kv_lens", None),
             return_logprob=self.return_logprob,
             top_logprobs_nums=self.top_logprobs_nums,
             token_ids_logprobs=self.token_ids_logprobs,
@@ -1984,3 +1961,7 @@ class ModelWorkerBatch:
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+
+    # KVPress: physical (compacted) KV cache lengths; differs from logical seq_lens.
+    # Propagated to ForwardBatch so the attention backend reads the correct KV range.
+    actual_kv_lens: Optional[torch.Tensor] = None
