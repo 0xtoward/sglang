@@ -135,10 +135,16 @@ is a property of the paged pool, not a bug.
   it can't be shared/ref-counted in the radix tree. (A *suffix-only, consumer-not-producer* coexistence
   is feasible — see design notes — but not implemented.)
 - **CUDA graph off:** per-request physical lengths are dynamic.
-- **Overlap scheduler off:** the one-step look-ahead allocates decode slots against the stale
-  pre-compaction layout, which historically caused double-free leaks and (as measured) silently
-  degrades compressed quality even on single-request runs (per_head→NV drops from 0.998 to
-  ~0.45–0.68). Force-off is therefore a **correctness gate**, not just a leak guard.
+- **Overlap scheduler: supported, but rarely a perf win on KVPress.** Historically force-off
+  because the one-step look-ahead allocated decode slots against the stale pre-compaction
+  layout (silent quality regression AND a +1 slot leak in `cache_finished_req` +
+  extra-delayed-token). Both are now resolved (commit `60fdcdb8b` + `80ef1d1fc`):
+  a deferred-merge **quarantine** in `get_next_batch_to_run` holds just-prefilled batches
+  back by one iter (so first-decode metadata is built *after* compaction), and the
+  "extra delayed token" free path is **skipped for compressed reqs** (cache_finished_req
+  already covers that slot via the live `actual_kv_len`). Throughput on this regime (see
+  table below) is unchanged-to-slightly-slower with overlap on; opt e is mainly a
+  correctness unblocker.
 - **Attention-free presses only:** SnapKV / ExpectedAttention / TOVA need observed attention scores,
   which SGLang's fused backends don't materialize. (`ExpectedAttention` is feasible via query
   statistics without kernel changes — a good future addition.)
@@ -163,6 +169,41 @@ so every batched path gets a single advanced-index gather for free.
 
 `batched` is the same kept-set as default, ~8× faster wall. `per_head` is **as fast as batched
 single-set** and reaches the full NV per-(layer, head) selection — essentially free quality.
+
+## End-to-end overlap perf (A800, single rank, repeat=3, max_new_tokens=64)
+
+To attribute the overlap overhead honestly, KVPress vs no-KVPress and TinyLlama-1.1B vs
+Qwen2.5-7B-Instruct are tested in the same harness (`kvpress_overlap_tiny.py` and
+`kvpress_overlap_bench.py`). Numbers below are tokens/sec (higher is better) and the
+overlap-on delta relative to overlap-off.
+
+| model               | KVPress  | concurrency  | OFF tok/s | ON tok/s | overlap Δ |
+|---|---|---|---|---|---|
+| TinyLlama-1.1B      | no       | 1            | 170.2     | **181.6** | **+6.7%** |
+| TinyLlama-1.1B      | no       | 4            | **206.5** | 188.4    | −9.6%     |
+| TinyLlama-1.1B      | knorm/per_head | 1      | **60.6**  | 56.2     | −7.7%     |
+| TinyLlama-1.1B      | knorm/per_head | 4      | **44.0**  | 41.7     | −5.5%     |
+| Qwen2.5-7B-Instruct | no       | 1            | **72.3**  | 64.0     | −11.6%    |
+| Qwen2.5-7B-Instruct | no       | 4            | **65.8**  | 63.6     | −3.4%     |
+| Qwen2.5-7B-Instruct | knorm/per_head | 1      | **54.8**  | 50.8     | −7.3%     |
+| Qwen2.5-7B-Instruct | knorm/per_head | 4      | **54.1**  | 51.4     | −5.0%     |
+
+Reads:
+- **Overlap only wins in one cell**: TinyLlama + no KVPress + single prompt (+6.7%). That's
+  the regime overlap was designed for — tiny model means each GPU iter is short, so CPU
+  scheduling is a meaningful fraction of wall time, and the look-ahead actually hides it.
+- The **opt-e cost on TinyLlama** is roughly the delta between rows 1 and 3: overlap goes
+  from +6.7% to −7.7% when KVPress is on, so KVPress adds about 14 percentage points of
+  relative overhead (quarantine adds one empty iter at first-decode; the look-ahead alloc
+  that compaction would later discard is pure waste). On Qwen2.5-7B that overhead shrinks
+  to ~4 pp (rows 5 vs 7: −11.6% → −7.3%) because the model's GPU work dwarfs the
+  scheduling work either way.
+- **Concurrency > 1** lengthens each GPU iter (batched) so CPU sched is hidden naturally;
+  overlap stops paying for itself (rows 2, 4, 6, 8).
+
+Bottom line: opt e is **a correctness unblocker, not a perf win**. Run with
+`--disable-overlap-schedule` by default; switch overlap on only if you've measured a win
+on your own workload (small model + low concurrency is the most likely candidate).
 
 ## Per-mode quality (3-mode e2e, ROUGE-L vs NV reference / vs full model)
 
