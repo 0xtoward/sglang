@@ -137,10 +137,24 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
+        # Track minimum available slots ever observed since the last reset.
+        # `size - min_available_ever` = peak (real) KV slots in use during a run.
+        # Used by the memory-vs-quality frontier eval; zero cost on the hot path.
+        self._min_available_ever = self.size
 
     def available_size(self):
         # To avoid minor "len(free_pages) * 1" overhead
         return len(self.free_pages) + len(self.release_pages)
+
+    def reset_peak_used(self):
+        """Set the watermark to the current available size, so subsequent calls to
+        peak_used_slots() measure the peak from NOW until the next reset."""
+        self._min_available_ever = self.available_size()
+
+    def peak_used_slots(self):
+        """Real peak number of KV slots ever simultaneously allocated since the
+        last reset. This is the metric a 'KV memory used' chart should plot."""
+        return self.size - self._min_available_ever
 
     def alloc(self, need_size: int):
         if self.need_sort and need_size > len(self.free_pages):
@@ -151,6 +165,18 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         select_index = self.free_pages[:need_size]
         self.free_pages = self.free_pages[need_size:]
+        avail = self.available_size()
+        if avail < self._min_available_ever:
+            self._min_available_ever = avail
+            # Subprocess→parent IPC for the frontier eval: write the running peak
+            # to a file the parent polls. Env-gated; no effect in normal runs.
+            _peak_path = __import__("os").environ.get("SGLANG_KVPRESS_PEAK_FILE")
+            if _peak_path:
+                try:
+                    with open(_peak_path, "w") as _f:
+                        _f.write(str(self.size - avail))
+                except Exception:
+                    pass
         return select_index
 
     def free(self, free_index: torch.Tensor):

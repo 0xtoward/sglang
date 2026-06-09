@@ -1048,21 +1048,17 @@ class Scheduler(
 
     # ===== KVPress: KV Cache Compression =====
     def _kvpress_compress_and_free(self, batch):
-        """Compress each request's prefill KV cache after prefill (per-token, NV-aligned).
-
-        SGLang's paged pool shares one slot across all layers and heads, so unlike NVIDIA
-        kvpress (per-head, per-layer pruning) we can only drop WHOLE tokens with a single
-        token set shared across layers. The press score is therefore aggregated across all
-        layers and the globally most important tokens are kept.
-        """
+        """Compress each request's prefill KV cache after prefill (per-token, NV-aligned)."""
         if self.kvpress_compression_ratio <= 0 or len(batch.reqs) == 0:
             return
+        torch.cuda.nvtx.range_push("kvpress.compress_batch")
         for req in batch.reqs:
             if req.is_retracted or req.finished() or req.is_chunked > 0:
                 continue
             if req.actual_kv_len is not None:  # already compressed
                 continue
             self._kvpress_compress_single_req(req)
+        torch.cuda.nvtx.range_pop()
 
     def _kvpress_compress_single_req(self, req):
         """Keep the top-(1-ratio) prefill tokens by press score. Three paths:
@@ -1140,6 +1136,22 @@ class Scheduler(
         req.actual_kv_len = n_kept          # live PHYSICAL kv length (grows during decode)
         req.original_prefill_len = seq_len  # logical length (for RoPE positions)
 
+        # Frontier eval IPC: append n_kept to a file so the parent process can
+        # see post-compaction footprint. Env-gated; no effect normally.
+        _path = os.environ.get("SGLANG_KVPRESS_NKEPT_FILE")
+        if _path:
+            try:
+                prev = 0
+                try:
+                    with open(_path) as f:
+                        prev = int(f.read().strip() or "0")
+                except FileNotFoundError:
+                    pass
+                with open(_path, "w") as f:
+                    f.write(str(prev + n_kept))
+            except Exception:
+                pass
+
     def _kvpress_pack_per_head(
         self, req, kv_pool, num_layers, valid_slots, num_valid, n_kept, kv_indices, seq_len
     ):
@@ -1161,23 +1173,27 @@ class Scheduler(
 
         # One stacked gather across all layers, then per-LAYER per-HEAD scoring.
         # Use the pool's contiguous backing for a 1-launch advanced-index gather (opt d).
+        torch.cuda.nvtx.range_push("kvpress.gather_K_V")
         if hasattr(kv_pool, "k_buffer_all"):
             K = kv_pool.k_buffer_all[:, valid_slots]
             V = kv_pool.v_buffer_all[:, valid_slots]
         else:
             K = torch.stack([kv_pool.k_buffer[l][valid_slots] for l in range(num_layers)], dim=0)
             V = torch.stack([kv_pool.v_buffer[l][valid_slots] for l in range(num_layers)], dim=0)
+        torch.cuda.nvtx.range_pop()
         # Per-(layer, token, head) scores [L, T, H] — NO cross-layer reduction.
+        torch.cuda.nvtx.range_push("kvpress.score")
         scores = self.kvpress_method.score_per_head_per_layer_batched(K, V).float()
+        torch.cuda.nvtx.range_pop()
 
         # Per-(layer, head) topk: at layer L, row r, head h -> kept_idx[L, r, h].
+        torch.cuda.nvtx.range_push("kvpress.topk")
         kept_idx = scores.topk(n_kept, dim=1).indices           # [L, n_kept, H]
         dst_slots = valid_slots[:n_kept]                        # [n_kept]; same dst row range every layer
+        torch.cuda.nvtx.range_pop()
 
         # Gather each layer's per-(row, head) selection into a temp, then scatter into dst.
-        # When the pool exposes the contiguous backing (opt d), do the gather AND scatter
-        # in one launch each by indexing the stacked [L, slots, H, D] tensor; otherwise fall
-        # back to the per-layer loop.
+        torch.cuda.nvtx.range_push("kvpress.gather_scatter")
         if hasattr(kv_pool, "k_buffer_all"):
             src_all = valid_slots[kept_idx]                                  # [L, n_kept, H]
             idx_all = src_all.unsqueeze(-1).expand(-1, -1, -1, D)            # [L, n_kept, H, D]
@@ -1187,14 +1203,15 @@ class Scheduler(
             kv_pool.v_buffer_all[:, dst_slots] = new_v
         else:
             for l in range(num_layers):
-                src_slots_l = valid_slots[kept_idx[l]]              # [n_kept, H]
-                kb = kv_pool.k_buffer[l]                            # [slots, H, D]
+                src_slots_l = valid_slots[kept_idx[l]]
+                kb = kv_pool.k_buffer[l]
                 vb = kv_pool.v_buffer[l]
-                idx = src_slots_l.unsqueeze(-1).expand(-1, -1, D)   # [n_kept, H, D]
-                new_k = torch.gather(kb, 0, idx)                    # [n_kept, H, D]
+                idx = src_slots_l.unsqueeze(-1).expand(-1, -1, D)
+                new_k = torch.gather(kb, 0, idx)
                 new_v = torch.gather(vb, 0, idx)
                 kb[dst_slots] = new_k
                 vb[dst_slots] = new_v
+        torch.cuda.nvtx.range_pop()
 
         # After scatter the data lives in dst_slots = valid_slots[:n_kept]; every other slot
         # in valid_slots is freeable (we already copied everything we want).
@@ -1208,6 +1225,21 @@ class Scheduler(
 
         req.actual_kv_len = n_kept
         req.original_prefill_len = seq_len
+
+        # Frontier eval IPC (same as single-set path).
+        _path = os.environ.get("SGLANG_KVPRESS_NKEPT_FILE")
+        if _path:
+            try:
+                prev = 0
+                try:
+                    with open(_path) as f:
+                        prev = int(f.read().strip() or "0")
+                except FileNotFoundError:
+                    pass
+                with open(_path, "w") as f:
+                    f.write(str(prev + n_kept))
+            except Exception:
+                pass
 
     @DynamicGradMode()
     def event_loop_normal(self):

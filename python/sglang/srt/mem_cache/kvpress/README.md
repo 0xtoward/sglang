@@ -170,6 +170,44 @@ so every batched path gets a single advanced-index gather for free.
 `batched` is the same kept-set as default, ~8× faster wall. `per_head` is **as fast as batched
 single-set** and reaches the full NV per-(layer, head) selection — essentially free quality.
 
+**In-engine NVTX breakdown** (Qwen2.5-7B, ratio 0.5, per_head; `nsys stats nvtx_pushpop_sum`,
+steady-state median per `compress_batch` instance — the first instance is ~70 ms one-off Triton
+autotune so use the median):
+
+| NVTX range | median | what |
+|---|---|---|
+| `kvpress.compress_batch` | **1.36 ms** | whole post-prefill compaction (per prompt) |
+| ` ├ kvpress.gather_scatter` | 0.30 ms | per-(layer,head) gather + scatter into kept slots (heaviest) |
+| ` ├ kvpress.gather_K_V` | 0.18 ms | one stacked `k_buffer_all[:, valid_slots]` gather |
+| ` ├ kvpress.score` | 0.11 ms | per-(layer,head) `-‖k‖` |
+| ` └ kvpress.topk` | 0.05 ms | per-(layer,head) top-n_kept |
+
+Compaction is **~0.3 % of the ~430 ms per-prompt wall** at this context — negligible. (Note: the
+.nsys-rep files capture NVTX + CPU samples but **not** the GPU hardware timeline — CUPTI GPU
+activity counters are blocked in the rental container; use the NVTX wall-time ranges above.)
+
+## Memory-vs-Quality frontier (REAL KV memory, needle-in-haystack, ~3.5k-token context)
+
+KV memory is measured by instrumenting `TokenToKVPoolAllocator` to record the post-compaction
+slot count (`sum(n_kept)`), times the model's true per-token KV bytes (Qwen2.5-7B: 57344 B/token =
+28 layers × 4 kv-heads × 128 dim × 2(K+V) × 2(bf16)). Not a formula estimate — the engine writes
+the real kept count. Recall = the planted passcode digits appear in the 8-token generation.
+
+| config | KV / prompt | saving | recall |
+|---|---|---|---|
+| baseline (no compression) | 189.7 MB | — | 1.00 |
+| **knorm/per_head r=0.3** | 132.5 MB | −30 % | **1.00** |
+| **knorm/per_head r=0.5** | 94.7 MB | −50 % | **1.00** |
+| **knorm/per_head r=0.7** | **56.8 MB** | **−70 %** | **1.00** |
+| streamingllm r=0.3 | 132.5 MB | −30 % | 0.75 |
+| streamingllm r=0.5 | 94.7 MB | −50 % | 0.50 |
+| streamingllm r=0.7 | 56.8 MB | −70 % | 0.25 |
+
+**Headline: `knorm/per_head` holds 100 % needle recall while cutting 70 % of KV memory.**
+`streamingllm` (sink+window, positional) degrades linearly because the needle sits mid-context —
+the expected failure mode of a positional press, and a good differentiator. (This is an *easy*
+needle — the passcode is verbatim in-context; RULER/LongBench would stress harder, see Roadmap.)
+
 ## End-to-end overlap perf (A800, single rank, repeat=3, max_new_tokens=64)
 
 To attribute the overlap overhead honestly, KVPress vs no-KVPress and TinyLlama-1.1B vs
@@ -236,6 +274,26 @@ tokens per head but quality is unchanged (random is a baseline floor).
 4. **ExpectedAttention press** via query statistics (no kernel surgery).
 5. **Compaction perf** — batch the per-layer gather into one kernel; make `actual_kv_lens` a single
    device-resident tensor (removes the per-decode `.item()` sync); optionally make KVPress overlap-safe.
+
+---
+
+## Where KVPress sits among SGLang's KV / attention optimizations
+
+KVPress is **KV-pool-side, post-prefill token pruning**. SGLang already ships several adjacent
+families; KVPress is orthogonal to most (different axis) and conflicts with prefix-sharing:
+
+| family | example (SGLang) | axis | vs KVPress |
+|---|---|---|---|
+| **sparse attention (compute)** | **MInference** — merged via [sgl#5327](https://github.com/sgl-project/sglang/pull/5327)/[#5329](https://github.com/sgl-project/sglang/issues/5329) as `sgl_kernel.sparse_flash_attn` consumed by the dual-chunk backend; auto-on when the model ships `dual_chunk_attention_config` + `sparse_attention_config.json` (e.g. Qwen2.5-1M) and `seq_len > threshold` | skips Q·K pairs at compute time; **does not free KV** | orthogonal (attention vs pool); not stacked yet |
+| | Double Sparsity (`--enable-double-sparsity`), NSA (`--attention-backend nsa`) | token+channel / model-native sparse | orthogonal |
+| **KV quantization (bytes)** | FP8 KV (`--kv-cache-dtype fp8_e4m3`) | ~4× fewer bytes/token | orthogonal, **stacks** (×ratio) |
+| **tiered KV (offload)** | HiCache (`--enable-hierarchical-cache`), LMCache | move cold KV to host/NVMe | partial overlap |
+| **layer-local KV** | SWA hybrid pool (`--swa-full-tokens-ratio`) | sliding window per layer | orthogonal (streamingllm press is its per-token cousin) |
+| **prefix sharing** | RadixCache | reuse shared-prefix KV | **conflicts** — KVPress requires `--disable-radix-cache` |
+
+So KVPress is the *token-count* lever; FP8 is the *bytes-per-token* lever (they compose); MInference
+is the *compute* lever (frees no memory). The cleanest combined story is **KVPress × FP8** for memory,
+not yet benchmarked here.
 
 ---
 
