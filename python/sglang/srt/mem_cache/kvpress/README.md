@@ -135,8 +135,10 @@ is a property of the paged pool, not a bug.
   it can't be shared/ref-counted in the radix tree. (A *suffix-only, consumer-not-producer* coexistence
   is feasible — see design notes — but not implemented.)
 - **CUDA graph off:** per-request physical lengths are dynamic.
-- **Overlap scheduler off:** the one-step look-ahead would alloc/free decode slots against the stale
-  pre-compaction layout (double-free). Recoverable with an overlap-safe redesign (design notes §c).
+- **Overlap scheduler off:** the one-step look-ahead allocates decode slots against the stale
+  pre-compaction layout, which historically caused double-free leaks and (as measured) silently
+  degrades compressed quality even on single-request runs (per_head→NV drops from 0.998 to
+  ~0.45–0.68). Force-off is therefore a **correctness gate**, not just a leak guard.
 - **Attention-free presses only:** SnapKV / ExpectedAttention / TOVA need observed attention scores,
   which SGLang's fused backends don't materialize. (`ExpectedAttention` is feasible via query
   statistics without kernel changes — a good future addition.)
@@ -146,18 +148,21 @@ is a property of the paged pool, not a bug.
 
 ---
 
-## Performance (compaction step, TinyLlama-class, num_valid=600, ratio=0.3)
+## Performance (compaction step, 22-layer model, num_valid=600, ratio=0.3)
 
-Micro-benchmark of the post-prefill compression on the A800 (torch.profiler kernel counts):
+Micro-benchmark of the post-prefill compression on the A800 (torch.profiler kernel counts).
+The pool now ALWAYS allocates K/V as one contiguous tensor with per-layer views (`k_buffer_all`),
+so every batched path gets a single advanced-index gather for free.
 
 | mode | flag | CUDA kernel launches | GPU µs | wall ms |
 |---|---|---|---|---|
 | current (per-layer loop) | default | 135 | 1172 | 1.752 |
-| batched single-set | `--kvpress-batched` | **8** | 300 | **0.161** |
-| per-head packing | `--kvpress-per-head` | 52 | 1074 | 0.790 |
+| no_d fallback (per-layer gather + stack) | — | 53 | 638 | 0.736 |
+| **batched single-set (with d)** | `--kvpress-batched` | **9** | 390 | **0.207** |
+| **per-(layer, head) (with d)** | `--kvpress-per-head` | **9** | 399 | **0.223** |
 
-`batched` is **same kept-set as default, ~11× faster wall** (kernel-launch-bound is collapsed). `per_head`
-is ~2× faster than default *and* reaches NV per-head selection.
+`batched` is the same kept-set as default, ~8× faster wall. `per_head` is **as fast as batched
+single-set** and reaches the full NV per-(layer, head) selection — essentially free quality.
 
 ## Per-mode quality (3-mode e2e, ROUGE-L vs NV reference / vs full model)
 

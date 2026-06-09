@@ -335,7 +335,9 @@ class Scheduler(
             #  - RadixCache (compressed cache content is request-specific, not shareable),
             #  - CUDA graphs (per-request physical lengths become dynamic),
             #  - the one-step-ahead overlap scheduler (it speculatively allocates decode
-            #    slots, which double-free against the compacted physical layout).
+            #    slots, which double-free against the compacted physical layout — or, more
+            #    insidiously, silently produces wrong outputs because lookahead state and
+            #    compacted state get out of sync; measured directly with the 3-mode harness).
             assert server_args.disable_radix_cache, "KVPress requires --disable-radix-cache"
             assert server_args.disable_cuda_graph, "KVPress requires --disable-cuda-graph"
             server_args.disable_overlap_schedule = True
@@ -1099,12 +1101,18 @@ class Scheduler(
 
         if self.kvpress_batched:
             # Stacked gather: K, V become [L, num_valid, H, D] -> one fused score call.
-            K = torch.stack(
-                [kv_pool.k_buffer[l][valid_slots] for l in range(num_layers)], dim=0
-            )
-            V = torch.stack(
-                [kv_pool.v_buffer[l][valid_slots] for l in range(num_layers)], dim=0
-            )
+            # When the pool exposes a contiguous backing (k_buffer_all) we do a single
+            # advanced-index gather; otherwise fall back to per-layer gather + stack.
+            if hasattr(kv_pool, "k_buffer_all"):
+                K = kv_pool.k_buffer_all[:, valid_slots]   # opt d: 1 launch
+                V = kv_pool.v_buffer_all[:, valid_slots]
+            else:
+                K = torch.stack(
+                    [kv_pool.k_buffer[l][valid_slots] for l in range(num_layers)], dim=0
+                )
+                V = torch.stack(
+                    [kv_pool.v_buffer[l][valid_slots] for l in range(num_layers)], dim=0
+                )
             scores = self.kvpress_method.score_batched(K, V).float()
         else:
             # Default: per-layer loop, cross-layer sum.
@@ -1153,8 +1161,13 @@ class Scheduler(
         D = kv_pool.k_buffer[0].shape[2]   # head_dim
 
         # One stacked gather across all layers, then per-LAYER per-HEAD scoring.
-        K = torch.stack([kv_pool.k_buffer[l][valid_slots] for l in range(num_layers)], dim=0)
-        V = torch.stack([kv_pool.v_buffer[l][valid_slots] for l in range(num_layers)], dim=0)
+        # Use the pool's contiguous backing for a 1-launch advanced-index gather (opt d).
+        if hasattr(kv_pool, "k_buffer_all"):
+            K = kv_pool.k_buffer_all[:, valid_slots]
+            V = kv_pool.v_buffer_all[:, valid_slots]
+        else:
+            K = torch.stack([kv_pool.k_buffer[l][valid_slots] for l in range(num_layers)], dim=0)
+            V = torch.stack([kv_pool.v_buffer[l][valid_slots] for l in range(num_layers)], dim=0)
         # Per-(layer, token, head) scores [L, T, H] — NO cross-layer reduction.
         scores = self.kvpress_method.score_per_head_per_layer_batched(K, V).float()
 
@@ -1162,17 +1175,27 @@ class Scheduler(
         kept_idx = scores.topk(n_kept, dim=1).indices           # [L, n_kept, H]
         dst_slots = valid_slots[:n_kept]                        # [n_kept]; same dst row range every layer
 
-        # Gather each layer's per-(row, head) selection into a temp, scatter into dst.
-        # Each layer chooses INDEPENDENTLY which source token goes at (row r, head h).
-        for l in range(num_layers):
-            src_slots_l = valid_slots[kept_idx[l]]              # [n_kept, H]
-            kb = kv_pool.k_buffer[l]                            # [slots, H, D]
-            vb = kv_pool.v_buffer[l]
-            idx = src_slots_l.unsqueeze(-1).expand(-1, -1, D)   # [n_kept, H, D]
-            new_k = torch.gather(kb, 0, idx)                    # [n_kept, H, D]
-            new_v = torch.gather(vb, 0, idx)
-            kb[dst_slots] = new_k
-            vb[dst_slots] = new_v
+        # Gather each layer's per-(row, head) selection into a temp, then scatter into dst.
+        # When the pool exposes the contiguous backing (opt d), do the gather AND scatter
+        # in one launch each by indexing the stacked [L, slots, H, D] tensor; otherwise fall
+        # back to the per-layer loop.
+        if hasattr(kv_pool, "k_buffer_all"):
+            src_all = valid_slots[kept_idx]                                  # [L, n_kept, H]
+            idx_all = src_all.unsqueeze(-1).expand(-1, -1, -1, D)            # [L, n_kept, H, D]
+            new_k = torch.gather(kv_pool.k_buffer_all, 1, idx_all)           # [L, n_kept, H, D]
+            new_v = torch.gather(kv_pool.v_buffer_all, 1, idx_all)
+            kv_pool.k_buffer_all[:, dst_slots] = new_k
+            kv_pool.v_buffer_all[:, dst_slots] = new_v
+        else:
+            for l in range(num_layers):
+                src_slots_l = valid_slots[kept_idx[l]]              # [n_kept, H]
+                kb = kv_pool.k_buffer[l]                            # [slots, H, D]
+                vb = kv_pool.v_buffer[l]
+                idx = src_slots_l.unsqueeze(-1).expand(-1, -1, D)   # [n_kept, H, D]
+                new_k = torch.gather(kb, 0, idx)                    # [n_kept, H, D]
+                new_v = torch.gather(vb, 0, idx)
+                kb[dst_slots] = new_k
+                vb[dst_slots] = new_v
 
         # After scatter the data lives in dst_slots = valid_slots[:n_kept]; every other slot
         # in valid_slots is freeable (we already copied everything we want).

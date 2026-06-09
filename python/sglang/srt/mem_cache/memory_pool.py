@@ -522,24 +522,27 @@ class MHATokenToKVPool(KVCache):
                 if self.enable_custom_mem_pool
                 else nullcontext()
             ):
-                # [size, head_num, head_dim] for each layer
+                # One contiguous allocation per K/V (shape [layer_num, size+page_size,
+                # head_num, head_dim]) with a per-layer view list for backwards compat.
+                # Same total memory and same per-layer shapes/strides as the L-separate
+                # allocations; downstream code that uses k_buffer[l] keeps working, and
+                # the kvpress compress path can do a single advanced-index gather over
+                # k_buffer_all instead of L per-layer gathers + a stack (optimization d).
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
-                self.k_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
-                self.v_buffer = [
-                    torch.zeros(
-                        (self.size + self.page_size, self.head_num, self.head_dim),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for _ in range(self.layer_num)
-                ]
+                self.k_buffer_all = torch.zeros(
+                    (self.layer_num, self.size + self.page_size,
+                     self.head_num, self.head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                self.v_buffer_all = torch.zeros(
+                    (self.layer_num, self.size + self.page_size,
+                     self.head_num, self.head_dim),
+                    dtype=self.store_dtype,
+                    device=self.device,
+                )
+                self.k_buffer = [self.k_buffer_all[l] for l in range(self.layer_num)]
+                self.v_buffer = [self.v_buffer_all[l] for l in range(self.layer_num)]
 
         self.k_data_ptrs = torch.tensor(
             [x.data_ptr() for x in self.k_buffer],
@@ -563,6 +566,11 @@ class MHATokenToKVPool(KVCache):
     def _clear_buffers(self):
         del self.k_buffer
         del self.v_buffer
+        # opt d: backing stacked tensors hold storage; release them too.
+        if hasattr(self, "k_buffer_all"):
+            del self.k_buffer_all
+        if hasattr(self, "v_buffer_all"):
+            del self.v_buffer_all
 
     def get_kv_size_bytes(self):
         assert hasattr(self, "k_buffer")
