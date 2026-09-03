@@ -9,6 +9,13 @@ keywords:
 mode: wide
 ---
 
+import { popularModels } from "/src/snippets/configs/popular-models.jsx";
+import { PopularModels } from "/src/snippets/_popular_models.jsx";
+
+{/* One hero per model, rotating. The Cookbook landing page renders the same
+    list as a compact strip. Edit the list, not this page. */}
+<PopularModels models={popularModels} variant="hero" />
+
 <a
   class="github-button"
   href="https://github.com/sgl-project/sglang"
